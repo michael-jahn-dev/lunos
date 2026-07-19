@@ -34,6 +34,14 @@ class Config:
 
     monitor_display: str | None = None  # e.g. "1" if multiple monitors are addressed via ddcutil
 
+    # On KDE Plasma 6, PowerDevil itself already drives external-monitor brightness over
+    # DDC/CI (org.kde.ScreenBrightness D-Bus service). When available, Lunos prefers it over
+    # calling ddcutil directly, so Plasma's own brightness slider/OSD stays in sync and two
+    # programs don't race to write the same monitor over DDC/CI. Falls back to ddcutil
+    # wherever that service isn't present (other desktops, no desktop at all, etc.).
+    prefer_powerdevil: bool = True
+    powerdevil_display_label_contains: str | None = None  # optional substring to pick a specific external display; defaults to the first non-internal one
+
     median_window: int = 3          # number of raw samples in the moving-median filter (swallows single spikes)
 
     # Ramp tuning: each step is a real ddcutil round-trip over DDC/CI (slow, often
@@ -121,11 +129,13 @@ def notify(message: str, config: Config) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Monitor control (DDC/CI via ddcutil)
+# Monitor control backends
 # --------------------------------------------------------------------------- #
 
-class MonitorController:
-    """Wraps reading/setting brightness via ddcutil."""
+class DdcutilBackend:
+    """Drives brightness directly via ddcutil (DDC/CI). Works everywhere ddcutil does."""
+
+    supports_ramping = True  # raw ddcutil doesn't debounce/animate on its own, so Lunos ramps it
 
     VCP_BRIGHTNESS_CODE = "10"
 
@@ -135,14 +145,13 @@ class MonitorController:
     def _display_args(self) -> list[str]:
         return ["--display", self._config.monitor_display] if self._config.monitor_display else []
 
-    def _run_setvcp(self, pct: int) -> None:
+    def set_pct(self, pct: int) -> None:
         command = ["ddcutil", "setvcp", self.VCP_BRIGHTNESS_CODE, str(pct)] + self._display_args()
         result = subprocess.run(command, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip())
 
-    def get_current_brightness_pct(self) -> int | None:
-        """Reads the monitor's current brightness, or None if it can't be determined."""
+    def get_current_pct(self) -> int | None:
         command = ["ddcutil", "getvcp", self.VCP_BRIGHTNESS_CODE, "--brief"] + self._display_args()
         result = subprocess.run(command, capture_output=True, text=True)
         if result.returncode != 0:
@@ -160,24 +169,159 @@ class MonitorController:
             return None
         return round(current_value / max_value * 100)
 
+
+# KDE Plasma 6's PowerDevil exposes external-monitor (DDC/CI) brightness control over D-Bus.
+# Interface confirmed against KDE's own source (daemon/dbus/org.kde.ScreenBrightness*.xml in
+# the powerdevil repo): a root org.kde.ScreenBrightness object lists per-display D-Bus names,
+# each exposed as a child org.kde.ScreenBrightness.Display object at
+# /org/kde/ScreenBrightness/[name] with Brightness/MaxBrightness/IsInternal/Label properties
+# and a SetBrightness(brightness, flags) method.
+POWERDEVIL_SERVICE = "org.kde.ScreenBrightness"
+POWERDEVIL_ROOT_PATH = "/org/kde/ScreenBrightness"
+POWERDEVIL_ROOT_INTERFACE = "org.kde.ScreenBrightness"
+POWERDEVIL_DISPLAY_INTERFACE = "org.kde.ScreenBrightness.Display"
+POWERDEVIL_SUPPRESS_INDICATOR_FLAG = 1  # don't pop up Plasma's own OSD for automated changes
+
+
+def _busctl_get_property(service: str, obj_path: str, interface: str, prop: str):
+    try:
+        result = subprocess.run(
+            ["busctl", "--user", "-j", "get-property", service, obj_path, interface, prop],
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)["data"]
+    except (json.JSONDecodeError, KeyError):
+        return None
+
+
+def _busctl_call(service: str, obj_path: str, interface: str, method: str, signature: str, *args) -> bool:
+    try:
+        result = subprocess.run(
+            ["busctl", "--user", "call", service, obj_path, interface, method, signature]
+            + [str(arg) for arg in args],
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        return False
+    return result.returncode == 0
+
+
+class PowerDevilBackend:
+    """
+    Drives brightness through KDE Plasma's PowerDevil instead of calling ddcutil directly.
+    PowerDevil is itself the one talking DDC/CI to the monitor on Plasma 6, so going through
+    it keeps Plasma's own brightness slider/OSD in sync and avoids two independent programs
+    racing to write the same monitor over DDC/CI. PowerDevil already debounces/protects its
+    own DDC/CI writes (a deliberate Plasma 6 change to avoid shortening monitor lifespan), so
+    this backend applies brightness in a single call instead of Lunos's own ramp.
+    """
+
+    supports_ramping = False
+
+    def __init__(self, display_path: str):
+        self._display_path = display_path
+
+    @staticmethod
+    def detect(config: Config) -> "PowerDevilBackend | None":
+        names = _busctl_get_property(
+            POWERDEVIL_SERVICE, POWERDEVIL_ROOT_PATH, POWERDEVIL_ROOT_INTERFACE, "DisplaysDBusNames"
+        )
+        if not names:
+            return None
+
+        for name in names:
+            display_path = f"{POWERDEVIL_ROOT_PATH}/{name}"
+            is_internal = _busctl_get_property(
+                POWERDEVIL_SERVICE, display_path, POWERDEVIL_DISPLAY_INTERFACE, "IsInternal"
+            )
+            if is_internal is None or is_internal:
+                continue
+
+            if config.powerdevil_display_label_contains:
+                label = _busctl_get_property(
+                    POWERDEVIL_SERVICE, display_path, POWERDEVIL_DISPLAY_INTERFACE, "Label"
+                ) or ""
+                if config.powerdevil_display_label_contains.lower() not in label.lower():
+                    continue
+
+            return PowerDevilBackend(display_path)
+
+        return None
+
+    def get_current_pct(self) -> int | None:
+        brightness = _busctl_get_property(
+            POWERDEVIL_SERVICE, self._display_path, POWERDEVIL_DISPLAY_INTERFACE, "Brightness"
+        )
+        max_brightness = _busctl_get_property(
+            POWERDEVIL_SERVICE, self._display_path, POWERDEVIL_DISPLAY_INTERFACE, "MaxBrightness"
+        )
+        if brightness is None or not max_brightness:
+            return None
+        return round(brightness / max_brightness * 100)
+
+    def set_pct(self, pct: int) -> None:
+        max_brightness = _busctl_get_property(
+            POWERDEVIL_SERVICE, self._display_path, POWERDEVIL_DISPLAY_INTERFACE, "MaxBrightness"
+        )
+        if not max_brightness:
+            raise RuntimeError("Could not read MaxBrightness from PowerDevil")
+
+        native_value = round(pct / 100 * max_brightness)
+        ok = _busctl_call(
+            POWERDEVIL_SERVICE, self._display_path, POWERDEVIL_DISPLAY_INTERFACE,
+            "SetBrightness", "iu", native_value, POWERDEVIL_SUPPRESS_INDICATOR_FLAG,
+        )
+        if not ok:
+            raise RuntimeError("busctl SetBrightness call to PowerDevil failed")
+
+
+class MonitorController:
+    """
+    Applies brightness changes through whichever backend is available: PowerDevil when
+    running under KDE Plasma 6 (preferred - keeps Plasma's own brightness UI in sync),
+    ddcutil directly everywhere else.
+    """
+
+    def __init__(self, config: Config):
+        self._config = config
+        self.backend = PowerDevilBackend.detect(config) if config.prefer_powerdevil else None
+        if self.backend is not None:
+            log("Brightness backend: KDE PowerDevil (org.kde.ScreenBrightness)")
+        else:
+            self.backend = DdcutilBackend(config)
+            log("Brightness backend: ddcutil (direct DDC/CI)")
+
+    def get_current_brightness_pct(self) -> int | None:
+        return self.backend.get_current_pct()
+
     def ramp_to(self, from_pct: int, to_pct: int) -> None:
         """
         Steps brightness from from_pct to to_pct, mimicking a real display's smooth
-        dim/brighten instead of an instant jump. Step count is capped at
+        dim/brighten instead of an instant jump - only on backends that need it
+        (PowerDevil already handles this itself). Step count is capped at
         max_transition_steps: a normal single-bucket change collapses to one
-        instant ddcutil call, while a large jump (e.g. a flashlight pointed at the
-        sensor) gets a short, bounded staircase instead of one big jump - without
-        turning into a multi-second slideshow of ddcutil round-trips.
+        instant call, while a large jump (e.g. a flashlight pointed at the sensor)
+        gets a short, bounded staircase instead of one big jump - without turning
+        into a multi-second slideshow of DDC/CI round-trips.
         """
         delta = to_pct - from_pct
         if delta == 0:
+            return
+
+        if not self.backend.supports_ramping:
+            self.backend.set_pct(to_pct)
             return
 
         ideal_steps = math.ceil(abs(delta) / self._config.transition_step_granularity_pct)
         step_count = max(1, min(self._config.max_transition_steps, ideal_steps))
         for step in range(1, step_count + 1):
             intermediate = round(from_pct + delta * step / step_count)
-            self._run_setvcp(intermediate)
+            self.backend.set_pct(intermediate)
             if step < step_count:
                 time.sleep(self._config.transition_step_delay_seconds)
 

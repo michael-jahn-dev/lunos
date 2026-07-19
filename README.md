@@ -2,7 +2,8 @@
 
 Ambient-light brightness daemon for Linux. Reads lux values from a
 [Lunar](https://lunar.fyi)-compatible ESP32 ambient-light sensor's SSE stream and automatically
-adjusts an external monitor's brightness via DDC/CI (`ddcutil`).
+adjusts an external monitor's brightness — through KDE Plasma's PowerDevil when available, or
+directly via DDC/CI (`ddcutil`) otherwise.
 
 Not affiliated with or endorsed by Lunar / Alin Panaitiu. Lunos is an independent client that
 talks to the sensor over its openly-documented [ESPHome](https://esphome.io) SSE API (see
@@ -19,9 +20,10 @@ and own yourself.
 4. Maps the smoothed lux value to a brightness percentage using an overlapping bucket table (see
    [Design notes](#design-notes)), which provides built-in hysteresis so minor light fluctuations
    don't cause flicker.
-5. Applies brightness changes via `ddcutil setvcp` — a single instant call for a normal
-   single-bucket change, or a short ramp of a few steps for a large jump (e.g. someone pointing a
-   flashlight at the sensor).
+5. Applies brightness changes through whichever backend is available (see
+   [Design notes](#design-notes)): a single instant call for a normal single-bucket change on
+   PowerDevil, or that plus a short ramp of a few steps for a large jump on ddcutil (e.g. someone
+   pointing a flashlight at the sensor).
 6. If the sensor stream stays connected but stops producing valid readings for too long (e.g. it's
    saturated by direct light), the daemon logs why and forces a reconnect instead of sitting idle.
 7. If it notices the monitor's actual brightness no longer matches what it last applied (e.g. you
@@ -34,8 +36,10 @@ and own yourself.
 
 - Linux with `systemd --user` support
 - Python 3.10+
-- [`ddcutil`](https://www.ddcutil.com/) installed, and a monitor that supports DDC/CI
-  (check with `ddcutil detect`)
+- A monitor that supports DDC/CI (check with `ddcutil detect`), and one of:
+  - KDE Plasma 6.0.4+ (uses PowerDevil's own DDC/CI brightness control automatically, no extra
+    setup — needs `busctl`, which ships with `systemd` and is virtually always present), or
+  - [`ddcutil`](https://www.ddcutil.com/) installed, for every other desktop (or no desktop)
 - A Lunar-compatible ambient-light sensor (ESP32/ESP8266 + TSL2591) on the same network,
   reachable at `lunarsensor.local` — see [lunar.fyi/sensor](https://lunar.fyi/sensor) for
   flashing/pairing instructions
@@ -68,7 +72,9 @@ There's no external config file — every setting lives in the `Config` dataclas
 |---|---|
 | `sensor_url` | SSE endpoint of the ambient-light sensor |
 | `sensor_event_id` | SSE channel id to read lux values from — must match your sensor's actual firmware id (check with `curl -N lunarsensor.local/events`), which can differ from lunar.fyi's generic docs example |
-| `monitor_display` | `ddcutil` display number, if you have more than one monitor (see `ddcutil detect`) |
+| `monitor_display` | `ddcutil` display number, if you have more than one monitor (see `ddcutil detect`); only used by the ddcutil backend |
+| `prefer_powerdevil` | Use KDE PowerDevil when available instead of ddcutil directly (see [Design notes](#design-notes)) |
+| `powerdevil_display_label_contains` | Optional substring to pick a specific external display under PowerDevil; defaults to the first non-internal one |
 | `median_window` | Raw samples used for outlier suppression |
 | `max_transition_steps` / `transition_step_granularity_pct` | Ramp tuning for large brightness jumps |
 | `transition_step_delay_seconds` | Pacing delay between individual ramp steps |
@@ -82,6 +88,37 @@ There's no external config file — every setting lives in the `Config` dataclas
 | `notification_timeout_ms` | How long a desktop notification stays visible |
 
 ## Design notes
+
+### Brightness backend: PowerDevil vs. ddcutil
+
+On KDE Plasma 6, PowerDevil already manages external-monitor brightness over DDC/CI itself, and
+exposes it over D-Bus as `org.kde.ScreenBrightness` (root object at `/org/kde/ScreenBrightness`,
+listing per-display child objects at `/org/kde/ScreenBrightness/[name]` implementing
+`org.kde.ScreenBrightness.Display`, with `Brightness`/`MaxBrightness`/`IsInternal`/`Label`
+properties and a `SetBrightness(brightness, flags)` method — confirmed against KDE's own source in
+the `powerdevil` repo, `daemon/dbus/org.kde.ScreenBrightness*.xml`). If Lunos called `ddcutil`
+directly on such a system, two problems would show up: Plasma's own brightness slider/OSD would go
+stale (it only reflects brightness changes it made itself), and two independent programs would be
+writing to the same monitor over DDC/CI, exactly the kind of conflict Plasma 6.0.4 specifically
+restructured its own DDC handling to avoid.
+
+`MonitorController` picks a backend at startup: `PowerDevilBackend.detect()` looks for the
+`org.kde.ScreenBrightness` service and the first non-internal display under it (or one matching
+`powerdevil_display_label_contains`, if set); if found, brightness changes go through PowerDevil,
+so Plasma's own UI/OSD is always accurate — it's the one making the change. Otherwise
+(`prefer_powerdevil = False`, no Plasma, `busctl` missing, or no matching display), it falls back
+to `DdcutilBackend`, calling `ddcutil` directly as before. D-Bus calls go through `busctl` (ships
+with `systemd`, no extra dependency) rather than a Python D-Bus binding, to avoid adding a
+dependency that's only needed on one of the two paths.
+
+The two backends also apply brightness differently: `DdcutilBackend.supports_ramping` is `True`
+(see ramped transitions below — raw ddcutil doesn't protect the monitor from rapid writes on its
+own), while `PowerDevilBackend.supports_ramping` is `False`, since PowerDevil 6.0.4+ already
+debounces and rate-limits its own DDC/CI writes to protect monitor lifespan — layering Lunos's ramp
+on top would just be redundant latency. `MonitorController.ramp_to()` checks this flag and applies
+the target in one call on PowerDevil, or steps it on ddcutil.
+
+### The lux-to-brightness curve
 
 The lux-to-brightness mapping is modeled on how real laptop ambient-light sensors behave
 (specifically Windows 11's documented "bucketed ALR curve", and the general shape of macOS's
