@@ -384,6 +384,14 @@ class ManualOverrideGuard:
     cooldown period instead of immediately overriding the manual change - mirroring
     macOS, which respects a manual brightness change for a while before resuming
     automatic control from that new baseline.
+
+    The mismatch is also remembered as a standing offset_pct (actual minus the
+    current bucket's raw table target), which future automatic adjustments add
+    on top of their own target - e.g. if you nudge the brightness 10% brighter
+    than what Lunos picked, later bucket changes land 10% brighter too, instead
+    of snapping back to the table's bare values every time. It's replaced (not
+    accumulated) by the next detected manual change, and only lives for the
+    current run - not saved anywhere, so it resets on restart.
     """
 
     def __init__(self, config: Config, monitor: MonitorController):
@@ -391,15 +399,18 @@ class ManualOverrideGuard:
         self._monitor = monitor
         self._last_poll_monotonic: float = 0.0
         self._override_until_monotonic: float = 0.0
+        self.offset_pct: int = 0
 
     def active(self) -> bool:
         return time.monotonic() < self._override_until_monotonic
 
-    def check(self, tracked_pct: int) -> int | None:
+    def check(self, tracked_pct: int, raw_target_pct: int) -> int | None:
         """
         Rate-limited poll of the monitor's actual brightness. Returns the actual
-        percentage (and starts/refreshes the cooldown) if it no longer matches
-        tracked_pct, or None if nothing changed or it isn't time to poll yet.
+        percentage (and starts/refreshes the cooldown, and recomputes offset_pct
+        against raw_target_pct - the current bucket's un-adjusted table target)
+        if it no longer matches tracked_pct, or None if nothing changed or it
+        isn't time to poll yet.
         """
         now = time.monotonic()
         if now - self._last_poll_monotonic < self._config.override_poll_interval_seconds:
@@ -412,6 +423,7 @@ class ManualOverrideGuard:
 
         if abs(actual_pct - tracked_pct) > self._config.manual_override_tolerance_pct:
             self._override_until_monotonic = now + self._config.manual_override_cooldown_seconds
+            self.offset_pct = actual_pct - raw_target_pct
             return actual_pct
 
         return None
@@ -514,13 +526,14 @@ def run(config: Config) -> None:
                     f"| bucket {target_bucket_index + 1} -> {config.buckets[target_bucket_index][2]}%"
                 )
 
-                override_pct = override_guard.check(current_pct)
+                override_pct = override_guard.check(current_pct, config.buckets[current_bucket_index][2])
                 if override_pct is not None:
                     current_pct = override_pct
                     current_bucket_index = nearest_bucket_index_for_pct(config.buckets, current_pct)
                     log(
                         f"Manual brightness change detected: now {current_pct}% - pausing "
-                        f"automatic adjustment for {config.manual_override_cooldown_seconds:.0f}s"
+                        f"automatic adjustment for {config.manual_override_cooldown_seconds:.0f}s "
+                        f"(remembering {override_guard.offset_pct:+d}% offset for future adjustments)"
                     )
                     notify(f"Manual brightness detected ({current_pct}%), auto-adjust paused", config)
                     continue
@@ -532,7 +545,7 @@ def run(config: Config) -> None:
                 if not update_gate.enough_time_passed():
                     continue
 
-                target_pct = config.buckets[target_bucket_index][2]
+                target_pct = max(0, min(100, config.buckets[target_bucket_index][2] + override_guard.offset_pct))
                 try:
                     monitor.ramp_to(current_pct, target_pct)
                     current_pct = target_pct

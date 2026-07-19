@@ -191,6 +191,13 @@ override — automatic adjustment pauses for `manual_override_cooldown_seconds`,
 value becomes the new tracked baseline rather than being discarded, so once the cooldown ends,
 future adjustments are relative to where you left it, not a snap back to the old bucket target.
 
+The mismatch also sets a standing `offset_pct` (the difference between your manually-set value and
+the current bucket's raw table target), which every future automatic adjustment adds on top of its
+own target, clamped to 0–100%. If you consistently nudge the brightness a bit brighter or dimmer
+than what Lunos picks, later bucket changes track that preference instead of reverting to the bare
+table values each time. The offset is replaced (not accumulated) by the next manual change, and
+only lives for the current run of the daemon — it isn't saved to disk, so it resets on restart.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
