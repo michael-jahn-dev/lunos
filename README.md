@@ -75,6 +75,9 @@ There's no external config file — every setting lives in the `Config` dataclas
 | `monitor_display` | `ddcutil` display number, if you have more than one monitor (see `ddcutil detect`); only used by the ddcutil backend |
 | `prefer_powerdevil` | Use KDE PowerDevil when available instead of ddcutil directly (see [Design notes](#design-notes)) |
 | `powerdevil_display_label_contains` | Optional substring to pick a specific external display under PowerDevil; defaults to the first non-internal one |
+| `powerdevil_show_osd` | Show Plasma's own brightness OSD for Lunos's automatic changes too (also what makes the brightness applet's slider stay in sync); only used by the PowerDevil backend. When enabled, the desktop notification on brightness change is skipped too, since the OSD already shows it |
+| `buckets` | The lux-to-brightness bucket table (see [Design notes](#design-notes)); tune to your own room/monitor |
+| `default_bucket_index` | Bucket to assume at cold boot if the monitor's current brightness can't be read |
 | `median_window` | Raw samples used for outlier suppression |
 | `max_transition_steps` / `transition_step_granularity_pct` | Ramp tuning for large brightness jumps |
 | `transition_step_delay_seconds` | Pacing delay between individual ramp steps |

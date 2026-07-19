@@ -41,6 +41,9 @@ class Config:
     # wherever that service isn't present (other desktops, no desktop at all, etc.).
     prefer_powerdevil: bool = True
     powerdevil_display_label_contains: str | None = None  # optional substring to pick a specific external display; defaults to the first non-internal one
+    powerdevil_show_osd: bool = True  # show Plasma's own brightness OSD for Lunos's changes too; also appears to be
+                                       # what makes the brightness applet's slider refresh, since PowerDevil's
+                                       # Brightness D-Bus property has no EmitsChangedSignal annotation
 
     median_window: int = 3          # number of raw samples in the moving-median filter (swallows single spikes)
 
@@ -70,41 +73,41 @@ class Config:
     notifications_enabled: bool = True   # show a desktop notification (via notify-send) on brightness changes
     notification_timeout_ms: int = 2000  # how long a desktop notification stays visible
 
+    # Overlapping (min_lux, max_lux, brightness_pct) buckets mapping ambient light to a target
+    # brightness. The overlap is intentional: it's what gives hysteresis "for free", the same way
+    # Windows 11's default ambient light response curve avoids flicker without a separately tuned
+    # threshold. Defaults are scaled to this project's sensor range (0-1000 lx) and monitor range
+    # (5-100%) - tune to your own room/monitor if the defaults feel off.
+    buckets: tuple[tuple[float, float, int], ...] = (
+        (0, 10, 5),
+        (5, 50, 20),
+        (15, 100, 35),
+        (60, 300, 50),
+        (150, 400, 65),
+        (250, 650, 80),
+        (350, 1000, 100),
+    )
+    default_bucket_index: int = 1  # bucket 2: the most common indoor lighting condition, same default as Windows
+
 
 # --------------------------------------------------------------------------- #
 # Bucketed lux -> brightness curve (modeled on Windows' bucketed ALR curve)
 # --------------------------------------------------------------------------- #
 
-# Overlapping (min_lux, max_lux, brightness_pct) buckets. The overlap is intentional:
-# it's what gives hysteresis "for free", the same way Windows 11's default ambient
-# light response curve avoids flicker without a separately tuned threshold.
-BUCKETS: tuple[tuple[float, float, int], ...] = (
-    (0, 10, 5),
-    (5, 50, 20),
-    (15, 100, 35),
-    (60, 300, 50),
-    (150, 400, 65),
-    (250, 650, 80),
-    (350, 1000, 100),
-)
-
-DEFAULT_BUCKET_INDEX = 1  # bucket 2: the most common indoor lighting condition, same default as Windows
-
-
-def nearest_bucket_index_for_pct(pct: int) -> int:
+def nearest_bucket_index_for_pct(buckets: tuple[tuple[float, float, int], ...], pct: int) -> int:
     """Finds the bucket whose target percentage is closest to a given brightness."""
-    return min(range(len(BUCKETS)), key=lambda i: abs(BUCKETS[i][2] - pct))
+    return min(range(len(buckets)), key=lambda i: abs(buckets[i][2] - pct))
 
 
-def select_bucket_index(lux: float, current_index: int) -> int:
+def select_bucket_index(buckets: tuple[tuple[float, float, int], ...], lux: float, current_index: int) -> int:
     """
     Picks the bucket for a lux reading: stays in the current bucket if it still
     contains the reading (this is the hysteresis), otherwise moves to the
     containing bucket closest to the current one.
     """
-    containing = [i for i, (lo, hi, _) in enumerate(BUCKETS) if lo <= lux <= hi]
+    containing = [i for i, (lo, hi, _) in enumerate(buckets) if lo <= lux <= hi]
     if not containing:
-        return 0 if lux < BUCKETS[0][0] else len(BUCKETS) - 1
+        return 0 if lux < buckets[0][0] else len(buckets) - 1
     if current_index in containing:
         return current_index
     return min(containing, key=lambda i: abs(i - current_index))
@@ -180,7 +183,7 @@ POWERDEVIL_SERVICE = "org.kde.ScreenBrightness"
 POWERDEVIL_ROOT_PATH = "/org/kde/ScreenBrightness"
 POWERDEVIL_ROOT_INTERFACE = "org.kde.ScreenBrightness"
 POWERDEVIL_DISPLAY_INTERFACE = "org.kde.ScreenBrightness.Display"
-POWERDEVIL_SUPPRESS_INDICATOR_FLAG = 1  # don't pop up Plasma's own OSD for automated changes
+POWERDEVIL_SUPPRESS_INDICATOR_BIT = 1  # the SetBrightness "flags" bit value defined by KDE's D-Bus API itself
 
 
 def _busctl_get_property(service: str, obj_path: str, interface: str, prop: str):
@@ -223,8 +226,9 @@ class PowerDevilBackend:
 
     supports_ramping = False
 
-    def __init__(self, display_path: str):
+    def __init__(self, display_path: str, config: Config):
         self._display_path = display_path
+        self._config = config
 
     @staticmethod
     def detect(config: Config) -> "PowerDevilBackend | None":
@@ -249,7 +253,7 @@ class PowerDevilBackend:
                 if config.powerdevil_display_label_contains.lower() not in label.lower():
                     continue
 
-            return PowerDevilBackend(display_path)
+            return PowerDevilBackend(display_path, config)
 
         return None
 
@@ -272,9 +276,10 @@ class PowerDevilBackend:
             raise RuntimeError("Could not read MaxBrightness from PowerDevil")
 
         native_value = round(pct / 100 * max_brightness)
+        flags = 0 if self._config.powerdevil_show_osd else POWERDEVIL_SUPPRESS_INDICATOR_BIT
         ok = _busctl_call(
             POWERDEVIL_SERVICE, self._display_path, POWERDEVIL_DISPLAY_INTERFACE,
-            "SetBrightness", "iu", native_value, POWERDEVIL_SUPPRESS_INDICATOR_FLAG,
+            "SetBrightness", "iu", native_value, flags,
         )
         if not ok:
             raise RuntimeError("busctl SetBrightness call to PowerDevil failed")
@@ -295,6 +300,10 @@ class MonitorController:
         else:
             self.backend = DdcutilBackend(config)
             log("Brightness backend: ddcutil (direct DDC/CI)")
+
+        # If PowerDevil is already going to show its own OSD for every change, a desktop
+        # notification on top of it would just be a redundant second popup.
+        self.shows_native_osd = isinstance(self.backend, PowerDevilBackend) and config.powerdevil_show_osd
 
     def get_current_brightness_pct(self) -> int | None:
         return self.backend.get_current_pct()
@@ -479,15 +488,15 @@ def run(config: Config) -> None:
 
     current_pct = monitor.get_current_brightness_pct()
     if current_pct is None:
-        current_pct = BUCKETS[DEFAULT_BUCKET_INDEX][2]
-        current_bucket_index = DEFAULT_BUCKET_INDEX
+        current_pct = config.buckets[config.default_bucket_index][2]
+        current_bucket_index = config.default_bucket_index
         log(f"Could not read current monitor brightness, assuming {current_pct}%.")
     else:
         # Anchor to whichever bucket's target is closest to the monitor's actual current
         # brightness, not a hardcoded default - otherwise a reading that happens to fall in
         # the assumed bucket's range never triggers an update, even if the real brightness
         # doesn't match that bucket's target at all.
-        current_bucket_index = nearest_bucket_index_for_pct(current_pct)
+        current_bucket_index = nearest_bucket_index_for_pct(config.buckets, current_pct)
         log(f"Current monitor brightness: {current_pct}% (starting in bucket {current_bucket_index + 1})")
 
     while True:
@@ -498,17 +507,17 @@ def run(config: Config) -> None:
                     log("Connected, waiting for lux values.")
 
                 smoothed_lux = median_filter.add_reading(raw_lux)
-                target_bucket_index = select_bucket_index(smoothed_lux, current_bucket_index)
+                target_bucket_index = select_bucket_index(config.buckets, smoothed_lux, current_bucket_index)
 
                 log(
                     f"Raw: {raw_lux:.1f} lx | Median: {smoothed_lux:.1f} lx "
-                    f"| bucket {target_bucket_index + 1} -> {BUCKETS[target_bucket_index][2]}%"
+                    f"| bucket {target_bucket_index + 1} -> {config.buckets[target_bucket_index][2]}%"
                 )
 
                 override_pct = override_guard.check(current_pct)
                 if override_pct is not None:
                     current_pct = override_pct
-                    current_bucket_index = nearest_bucket_index_for_pct(current_pct)
+                    current_bucket_index = nearest_bucket_index_for_pct(config.buckets, current_pct)
                     log(
                         f"Manual brightness change detected: now {current_pct}% - pausing "
                         f"automatic adjustment for {config.manual_override_cooldown_seconds:.0f}s"
@@ -523,14 +532,15 @@ def run(config: Config) -> None:
                 if not update_gate.enough_time_passed():
                     continue
 
-                target_pct = BUCKETS[target_bucket_index][2]
+                target_pct = config.buckets[target_bucket_index][2]
                 try:
                     monitor.ramp_to(current_pct, target_pct)
                     current_pct = target_pct
                     current_bucket_index = target_bucket_index
                     update_gate.mark_applied()
                     log(f"Brightness set: {target_pct}% (at {smoothed_lux:.1f} lx)")
-                    notify(f"Brightness: {target_pct}% ({smoothed_lux:.1f} lx)", config)
+                    if not monitor.shows_native_osd:
+                        notify(f"Brightness: {target_pct}% ({smoothed_lux:.1f} lx)", config)
                 except RuntimeError as error:
                     log(f"ERROR while setting brightness ({target_pct}%): {error}")
                     notify(f"Error setting brightness: {str(error)[:80]}", config)
