@@ -4,6 +4,11 @@ Ambient-light brightness daemon for Linux. Reads lux values from a
 [Lunar](https://lunar.fyi)-compatible ESP32 ambient-light sensor's SSE stream and automatically
 adjusts an external monitor's brightness via DDC/CI (`ddcutil`).
 
+Not affiliated with or endorsed by Lunar / Alin Panaitiu. Lunos is an independent client that
+talks to the sensor over its openly-documented [ESPHome](https://esphome.io) SSE API (see
+[lunar.fyi/sensor](https://lunar.fyi/sensor)) — the sensor is commodity ESP32 hardware you flash
+and own yourself.
+
 ## How it works
 
 1. Connects to the sensor's SSE endpoint (`http://lunarsensor.local/events` by default).
@@ -145,3 +150,7 @@ beyond `manual_override_tolerance_pct` (e.g. you pressed a brightness key) is tr
 override — automatic adjustment pauses for `manual_override_cooldown_seconds`, and the manually-set
 value becomes the new tracked baseline rather than being discarded, so once the cooldown ends,
 future adjustments are relative to where you left it, not a snap back to the old bucket target.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
