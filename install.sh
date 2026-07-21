@@ -32,7 +32,7 @@ Wants=network-online.target
 ExecStart=$VENV_DIR/bin/python3 $PROJECT_DIR/main.py
 Restart=always
 RestartSec=5
-CC
+
 [Install]
 WantedBy=default.target
 EOF
