@@ -56,9 +56,14 @@ class Config:
 
     min_seconds_between_updates: float = 2.0  # minimum gap between two applied brightness changes
 
+    # Never drive the monitor below this, even after a remembered manual offset is applied.
+    # A large negative offset (e.g. a -30% manual nudge while the screen was bright) added to
+    # a low bucket target can otherwise clamp all the way to 0% and black the display out.
+    min_brightness_pct: int = 5
+
     # Manual-override detection (mirrors macOS: a manual brightness change is respected
     # for a while instead of being immediately overridden by the next auto-adjustment).
-    override_poll_interval_seconds: float = 10.0   # how often to check actual vs. tracked brightness
+    override_poll_interval_seconds: float = 3.0    # how often to check actual vs. tracked brightness
     manual_override_tolerance_pct: int = 3          # mismatch beyond this counts as a manual change
     manual_override_cooldown_seconds: float = 300.0  # how long to pause auto-adjustment afterwards
 
@@ -71,7 +76,7 @@ class Config:
     connection_timeout_seconds: float = 30.0    # connect + read timeout for the SSE HTTP request
 
     notifications_enabled: bool = True   # show a desktop notification (via notify-send) on brightness changes
-    notification_timeout_ms: int = 2000  # how long a desktop notification stays visible
+    notification_timeout_ms: int = 5000  # how long a desktop notification stays visible
 
     # Overlapping (min_lux, max_lux, brightness_pct) buckets mapping ambient light to a target
     # brightness. The overlap is intentional: it's what gives hysteresis "for free", the same way
@@ -386,31 +391,44 @@ class ManualOverrideGuard:
     automatic control from that new baseline.
 
     The mismatch is also remembered as a standing offset_pct (actual minus the
-    current bucket's raw table target), which future automatic adjustments add
-    on top of their own target - e.g. if you nudge the brightness 10% brighter
-    than what Lunos picked, later bucket changes land 10% brighter too, instead
-    of snapping back to the table's bare values every time. It's replaced (not
-    accumulated) by the next detected manual change, and only lives for the
-    current run - not saved anywhere, so it resets on restart.
+    table target of the bucket *nearest the new brightness*), which future
+    automatic adjustments add on top of their own target - e.g. if you nudge the
+    brightness 10% brighter than what Lunos picked, later bucket changes land 10%
+    brighter too, instead of snapping back to the table's bare values every time.
+
+    The baseline is the nearest bucket to the *new* actual brightness, not the
+    bucket Lunos was previously in: a manual change large enough to land in a
+    different bucket is mostly a bucket move, not an offset, and measuring against
+    the old bucket would double-count that move (and make the offset jump wildly
+    for a small brightness nudge, depending on which bucket you happened to be in).
+
+    It's replaced (not accumulated) by the next detected manual change, and only
+    lives for the current run - not saved anywhere, so it resets on restart.
     """
 
     def __init__(self, config: Config, monitor: MonitorController):
         self._config = config
         self._monitor = monitor
-        self._last_poll_monotonic: float = 0.0
+        # Seed the poll timer to "now" so the first override check is deferred by a full
+        # poll interval. time.monotonic() is already large at boot (seconds since boot),
+        # so a 0.0 start would let the very first lux reading poll immediately - comparing
+        # two independent, not-yet-settled boot-time brightness reads and misreading the
+        # difference as a manual change. Starting the clock here gives the display/DDC-CI
+        # a moment to settle before the guard is allowed to react.
+        self._last_poll_monotonic: float = time.monotonic()
         self._override_until_monotonic: float = 0.0
         self.offset_pct: int = 0
 
     def active(self) -> bool:
         return time.monotonic() < self._override_until_monotonic
 
-    def check(self, tracked_pct: int, raw_target_pct: int) -> int | None:
+    def check(self, tracked_pct: int) -> int | None:
         """
         Rate-limited poll of the monitor's actual brightness. Returns the actual
         percentage (and starts/refreshes the cooldown, and recomputes offset_pct
-        against raw_target_pct - the current bucket's un-adjusted table target)
-        if it no longer matches tracked_pct, or None if nothing changed or it
-        isn't time to poll yet.
+        against the table target of the bucket nearest that new brightness) if it
+        no longer matches tracked_pct, or None if nothing changed or it isn't time
+        to poll yet.
         """
         now = time.monotonic()
         if now - self._last_poll_monotonic < self._config.override_poll_interval_seconds:
@@ -423,7 +441,8 @@ class ManualOverrideGuard:
 
         if abs(actual_pct - tracked_pct) > self._config.manual_override_tolerance_pct:
             self._override_until_monotonic = now + self._config.manual_override_cooldown_seconds
-            self.offset_pct = actual_pct - raw_target_pct
+            nearest_index = nearest_bucket_index_for_pct(self._config.buckets, actual_pct)
+            self.offset_pct = actual_pct - self._config.buckets[nearest_index][2]
             return actual_pct
 
         return None
@@ -509,7 +528,7 @@ def run(config: Config) -> None:
         # the assumed bucket's range never triggers an update, even if the real brightness
         # doesn't match that bucket's target at all.
         current_bucket_index = nearest_bucket_index_for_pct(config.buckets, current_pct)
-        log(f"Current monitor brightness: {current_pct}% (starting in bucket {current_bucket_index + 1})")
+        log(f"Current monitor brightness: {current_pct}% (Bucket: {current_bucket_index + 1})")
 
     while True:
         try:
@@ -523,10 +542,12 @@ def run(config: Config) -> None:
 
                 log(
                     f"Raw: {raw_lux:.1f} lx | Median: {smoothed_lux:.1f} lx "
-                    f"| bucket {target_bucket_index + 1} -> {config.buckets[target_bucket_index][2]}%"
+                    f"| Bucket: {target_bucket_index + 1} ({config.buckets[target_bucket_index][2]}%) "
+                    f"| Offset: {override_guard.offset_pct:+d}%"
                 )
 
-                override_pct = override_guard.check(current_pct, config.buckets[current_bucket_index][2])
+                override_pct = override_guard.check(current_pct)
+
                 if override_pct is not None:
                     current_pct = override_pct
                     current_bucket_index = nearest_bucket_index_for_pct(config.buckets, current_pct)
@@ -545,7 +566,8 @@ def run(config: Config) -> None:
                 if not update_gate.enough_time_passed():
                     continue
 
-                target_pct = max(0, min(100, config.buckets[target_bucket_index][2] + override_guard.offset_pct))
+                target_pct = max(config.min_brightness_pct, min(100, config.buckets[target_bucket_index][2] + override_guard.offset_pct))
+
                 try:
                     monitor.ramp_to(current_pct, target_pct)
                     current_pct = target_pct
