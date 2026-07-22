@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Lunos is a single-file Python daemon (`main.py`) that reads lux values from a Lunar-compatible ESP32 ambient-light sensor over its SSE stream and drives an external monitor's brightness to match. All logic — config, backends, filtering, main loop — lives in `main.py`; there is no package structure. Tests live alongside it in `test_main.py` (stdlib `unittest`).
+Lunos is a single-file Python daemon (`main.py`) that reads lux values from a Lunar-compatible ESP32 ambient-light sensor over its SSE stream and drives an external monitor's brightness to match. All logic — config, backends, filtering, main loop — lives in `main.py`; there is no package structure. Tests live in `tests/test_main.py` (stdlib `unittest`).
 
 ## Commands
 
@@ -14,12 +14,12 @@ venv/bin/python3 main.py                        # run directly in the foreground
 systemctl --user status lunos.service           # service status
 journalctl --user -u lunos.service -f           # follow live logs
 systemctl --user restart lunos.service          # apply changes after editing main.py
-venv/bin/python3 -m unittest test_main -v        # run the unit tests
+venv/bin/python3 -m unittest tests.test_main -v   # run the unit tests (from the repo root)
 ```
 
 There is no build or lint tooling. `install.sh` is idempotent: it reuses an existing `venv/` and rewrites the unit file each run.
 
-**Run the tests after every change to `main.py`** (`venv/bin/python3 -m unittest test_main`) and confirm they pass before considering the change done. `test_main.py` uses fakes for the monitor and sensor, so it needs no hardware, `busctl`, or `ddcutil` — but it does import `main`, so run it through the venv (which has `requests`/`sseclient`). When you change or add behavior, add or update the corresponding test in the same edit.
+**Run the tests after every change to `main.py`** (`venv/bin/python3 -m unittest tests.test_main`, from the repo root) and confirm they pass before considering the change done. `tests/test_main.py` uses fakes for the monitor and sensor, so it needs no hardware, `busctl`, or `ddcutil` — but it does import `main`, so run it through the venv (which has `requests`/`sseclient`). When you change or add behavior, add or update the corresponding test in the same edit.
 
 ## Configuration model
 
