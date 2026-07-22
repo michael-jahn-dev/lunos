@@ -16,7 +16,7 @@ import subprocess
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime
+from typing import NamedTuple, Protocol
 
 
 import requests
@@ -26,6 +26,14 @@ import sseclient
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
+
+class Bucket(NamedTuple):
+    """One rung of the lux -> brightness curve. A tuple, so existing indexing still
+    works, but named access (`.brightness_pct`) reads far better than `[2]`."""
+    min_lux: float
+    max_lux: float
+    brightness_pct: int
+
 
 @dataclass(frozen=True)
 class Config:
@@ -76,21 +84,21 @@ class Config:
     connection_timeout_seconds: float = 30.0    # connect + read timeout for the SSE HTTP request
 
     notifications_enabled: bool = True   # show a desktop notification (via notify-send) on brightness changes
-    notification_timeout_ms: int = 5000  # how long a desktop notification stays visible
+    notification_timeout_ms: int = 10000  # how long a desktop notification stays visible
 
     # Overlapping (min_lux, max_lux, brightness_pct) buckets mapping ambient light to a target
     # brightness. The overlap is intentional: it's what gives hysteresis "for free", the same way
     # Windows 11's default ambient light response curve avoids flicker without a separately tuned
     # threshold. Defaults are scaled to this project's sensor range (0-1000 lx) and monitor range
     # (5-100%) - tune to your own room/monitor if the defaults feel off.
-    buckets: tuple[tuple[float, float, int], ...] = (
-        (0, 10, 5),
-        (5, 50, 20),
-        (15, 100, 35),
-        (60, 300, 50),
-        (150, 400, 65),
-        (250, 650, 80),
-        (350, 1000, 100),
+    buckets: tuple[Bucket, ...] = (
+        Bucket(0, 10, 5),
+        Bucket(5, 50, 20),
+        Bucket(15, 100, 35),
+        Bucket(60, 300, 50),
+        Bucket(150, 400, 65),
+        Bucket(250, 650, 80),
+        Bucket(350, 1000, 100),
     )
     default_bucket_index: int = 1  # bucket 2: the most common indoor lighting condition, same default as Windows
 
@@ -99,20 +107,20 @@ class Config:
 # Bucketed lux -> brightness curve (modeled on Windows' bucketed ALR curve)
 # --------------------------------------------------------------------------- #
 
-def nearest_bucket_index_for_pct(buckets: tuple[tuple[float, float, int], ...], pct: int) -> int:
+def nearest_bucket_index_for_pct(buckets: tuple[Bucket, ...], pct: int) -> int:
     """Finds the bucket whose target percentage is closest to a given brightness."""
-    return min(range(len(buckets)), key=lambda i: abs(buckets[i][2] - pct))
+    return min(range(len(buckets)), key=lambda i: abs(buckets[i].brightness_pct - pct))
 
 
-def select_bucket_index(buckets: tuple[tuple[float, float, int], ...], lux: float, current_index: int) -> int:
+def select_bucket_index(buckets: tuple[Bucket, ...], lux: float, current_index: int) -> int:
     """
     Picks the bucket for a lux reading: stays in the current bucket if it still
     contains the reading (this is the hysteresis), otherwise moves to the
     containing bucket closest to the current one.
     """
-    containing = [i for i, (lo, hi, _) in enumerate(buckets) if lo <= lux <= hi]
+    containing = [i for i, b in enumerate(buckets) if b.min_lux <= lux <= b.max_lux]
     if not containing:
-        return 0 if lux < buckets[0][0] else len(buckets) - 1
+        return 0 if lux < buckets[0].min_lux else len(buckets) - 1
     if current_index in containing:
         return current_index
     return min(containing, key=lambda i: abs(i - current_index))
@@ -123,15 +131,14 @@ def select_bucket_index(buckets: tuple[tuple[float, float, int], ...], lux: floa
 # --------------------------------------------------------------------------- #
 
 def log(message: str) -> None:
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    print(f"[{timestamp}] {message}", flush=True)
+    print(message, flush=True)
 
 
 def notify(message: str, config: Config) -> None:
     if not config.notifications_enabled:
         return
     subprocess.run(
-        ["notify-send", "-t", str(config.notification_timeout_ms), "Lunos", message],
+        ["notify-send", "-t", str(config.notification_timeout_ms), "-i", "info", "-a", "Lunos", "Lunos", message],
         check=False,
     )
 
@@ -139,6 +146,17 @@ def notify(message: str, config: Config) -> None:
 # --------------------------------------------------------------------------- #
 # Monitor control backends
 # --------------------------------------------------------------------------- #
+
+class BrightnessBackend(Protocol):
+    """The contract every backend implements, so MonitorController can treat them
+    interchangeably. `supports_ramping` decides whether Lunos animates the change
+    itself or hands over a single write (see MonitorController.ramp_to)."""
+
+    supports_ramping: bool
+
+    def get_current_pct(self) -> int | None: ...
+    def set_pct(self, pct: int) -> None: ...
+
 
 class DdcutilBackend:
     """Drives brightness directly via ddcutil (DDC/CI). Works everywhere ddcutil does."""
@@ -234,6 +252,19 @@ class PowerDevilBackend:
     def __init__(self, display_path: str, config: Config):
         self._display_path = display_path
         self._config = config
+        self._cached_max_brightness: int | None = None
+
+    def _display_property(self, prop: str):
+        return _busctl_get_property(
+            POWERDEVIL_SERVICE, self._display_path, POWERDEVIL_DISPLAY_INTERFACE, prop
+        )
+
+    def _max_brightness(self) -> int | None:
+        # MaxBrightness is a fixed property of the display, so read it once and reuse it -
+        # avoids a second busctl process on every brightness poll (every few seconds).
+        if not self._cached_max_brightness:
+            self._cached_max_brightness = self._display_property("MaxBrightness")
+        return self._cached_max_brightness
 
     @staticmethod
     def detect(config: Config) -> "PowerDevilBackend | None":
@@ -263,20 +294,14 @@ class PowerDevilBackend:
         return None
 
     def get_current_pct(self) -> int | None:
-        brightness = _busctl_get_property(
-            POWERDEVIL_SERVICE, self._display_path, POWERDEVIL_DISPLAY_INTERFACE, "Brightness"
-        )
-        max_brightness = _busctl_get_property(
-            POWERDEVIL_SERVICE, self._display_path, POWERDEVIL_DISPLAY_INTERFACE, "MaxBrightness"
-        )
+        brightness = self._display_property("Brightness")
+        max_brightness = self._max_brightness()
         if brightness is None or not max_brightness:
             return None
         return round(brightness / max_brightness * 100)
 
     def set_pct(self, pct: int) -> None:
-        max_brightness = _busctl_get_property(
-            POWERDEVIL_SERVICE, self._display_path, POWERDEVIL_DISPLAY_INTERFACE, "MaxBrightness"
-        )
+        max_brightness = self._max_brightness()
         if not max_brightness:
             raise RuntimeError("Could not read MaxBrightness from PowerDevil")
 
@@ -299,7 +324,9 @@ class MonitorController:
 
     def __init__(self, config: Config):
         self._config = config
-        self.backend = PowerDevilBackend.detect(config) if config.prefer_powerdevil else None
+        self.backend: BrightnessBackend | None = (
+            PowerDevilBackend.detect(config) if config.prefer_powerdevil else None
+        )
         if self.backend is not None:
             log("Brightness backend: KDE PowerDevil (org.kde.ScreenBrightness)")
         else:
@@ -391,16 +418,16 @@ class ManualOverrideGuard:
     automatic control from that new baseline.
 
     The mismatch is also remembered as a standing offset_pct (actual minus the
-    table target of the bucket *nearest the new brightness*), which future
+    target of the bucket the *ambient light currently selects*), which future
     automatic adjustments add on top of their own target - e.g. if you nudge the
     brightness 10% brighter than what Lunos picked, later bucket changes land 10%
     brighter too, instead of snapping back to the table's bare values every time.
 
-    The baseline is the nearest bucket to the *new* actual brightness, not the
-    bucket Lunos was previously in: a manual change large enough to land in a
-    different bucket is mostly a bucket move, not an offset, and measuring against
-    the old bucket would double-count that move (and make the offset jump wildly
-    for a small brightness nudge, depending on which bucket you happened to be in).
+    The reference is the ambient-selected bucket - the same bucket the offset is
+    later added back to - so the delta is measured against exactly what it will be
+    applied to. Measuring against the bucket nearest the new brightness instead
+    would let the reference jump a whole bucket for a small manual nudge, flipping
+    the offset's sign even though the user's intent barely changed.
 
     It's replaced (not accumulated) by the next detected manual change, and only
     lives for the current run - not saved anywhere, so it resets on restart.
@@ -422,13 +449,14 @@ class ManualOverrideGuard:
     def active(self) -> bool:
         return time.monotonic() < self._override_until_monotonic
 
-    def check(self, tracked_pct: int) -> int | None:
+    def check(self, tracked_pct: int, ambient_target_pct: int) -> int | None:
         """
         Rate-limited poll of the monitor's actual brightness. Returns the actual
         percentage (and starts/refreshes the cooldown, and recomputes offset_pct
-        against the table target of the bucket nearest that new brightness) if it
-        no longer matches tracked_pct, or None if nothing changed or it isn't time
-        to poll yet.
+        as the manual value's delta from ambient_target_pct - the target of the
+        bucket the ambient light currently selects, which is the same bucket the
+        offset is later added back to) if it no longer matches tracked_pct, or
+        None if nothing changed or it isn't time to poll yet.
         """
         now = time.monotonic()
         if now - self._last_poll_monotonic < self._config.override_poll_interval_seconds:
@@ -441,8 +469,7 @@ class ManualOverrideGuard:
 
         if abs(actual_pct - tracked_pct) > self._config.manual_override_tolerance_pct:
             self._override_until_monotonic = now + self._config.manual_override_cooldown_seconds
-            nearest_index = nearest_bucket_index_for_pct(self._config.buckets, actual_pct)
-            self.offset_pct = actual_pct - self._config.buckets[nearest_index][2]
+            self.offset_pct = actual_pct - ambient_target_pct
             return actual_pct
 
         return None
@@ -476,33 +503,39 @@ def read_ambient_lux_values(config: Config):
     response = requests.get(
         config.sensor_url, stream=True, timeout=config.connection_timeout_seconds
     )
-    client = sseclient.SSEClient(response)
+    try:
+        client = sseclient.SSEClient(response)
 
-    last_valid_reading_monotonic = time.monotonic()
+        last_valid_reading_monotonic = time.monotonic()
 
-    for event in client.events():
-        if time.monotonic() - last_valid_reading_monotonic > config.stale_reading_timeout_seconds:
-            raise StaleSensorData(
-                f"No valid lux reading in over {config.stale_reading_timeout_seconds:.0f}s "
-                f"(sensor may be saturated or stuck)"
-            )
+        for event in client.events():
+            if time.monotonic() - last_valid_reading_monotonic > config.stale_reading_timeout_seconds:
+                raise StaleSensorData(
+                    f"No valid lux reading in over {config.stale_reading_timeout_seconds:.0f}s "
+                    f"(sensor may be saturated or stuck)"
+                )
 
-        if not event.data or not event.data.strip():
-            continue  # keep-alive / empty line
+            if not event.data or not event.data.strip():
+                continue  # keep-alive / empty line
 
-        try:
-            payload = json.loads(event.data)
-        except json.JSONDecodeError:
-            clean_text = ANSI_ESCAPE_RE.sub("", event.data).strip()
-            log(f"[sensor] {clean_text}")
-            continue
+            try:
+                payload = json.loads(event.data)
+            except json.JSONDecodeError:
+                clean_text = ANSI_ESCAPE_RE.sub("", event.data).strip()
+                log(f"[sensor] {clean_text}")
+                continue
 
-        if payload.get("id") != config.sensor_event_id:
-            continue  # different sensor channel, not relevant
+            if payload.get("id") != config.sensor_event_id:
+                continue  # different sensor channel, not relevant
 
-        lux = payload.get("value")
-        if lux is not None:
-            yield float(lux)
+            lux = payload.get("value")
+            if lux is not None:
+                # Reset the staleness clock on every valid reading; otherwise the timeout
+                # measures time-since-connect and tears down a perfectly healthy stream.
+                last_valid_reading_monotonic = time.monotonic()
+                yield float(lux)
+    finally:
+        response.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -519,7 +552,7 @@ def run(config: Config) -> None:
 
     current_pct = monitor.get_current_brightness_pct()
     if current_pct is None:
-        current_pct = config.buckets[config.default_bucket_index][2]
+        current_pct = config.buckets[config.default_bucket_index].brightness_pct
         current_bucket_index = config.default_bucket_index
         log(f"Could not read current monitor brightness, assuming {current_pct}%.")
     else:
@@ -539,24 +572,28 @@ def run(config: Config) -> None:
 
                 smoothed_lux = median_filter.add_reading(raw_lux)
                 target_bucket_index = select_bucket_index(config.buckets, smoothed_lux, current_bucket_index)
+                target_bucket_pct = config.buckets[target_bucket_index].brightness_pct
 
                 log(
                     f"Raw: {raw_lux:.1f} lx | Median: {smoothed_lux:.1f} lx "
-                    f"| Bucket: {target_bucket_index + 1} ({config.buckets[target_bucket_index][2]}%) "
+                    f"| Bucket: {target_bucket_index + 1} ({target_bucket_pct}%) "
+                    f"| Brightness: {current_pct}% "
                     f"| Offset: {override_guard.offset_pct:+d}%"
                 )
 
-                override_pct = override_guard.check(current_pct)
+                override_pct = override_guard.check(current_pct, target_bucket_pct)
 
                 if override_pct is not None:
                     current_pct = override_pct
-                    current_bucket_index = nearest_bucket_index_for_pct(config.buckets, current_pct)
+                    # Anchor to the ambient-selected bucket, not the bucket nearest the manual
+                    # brightness: the offset now carries the manual delta relative to this bucket,
+                    # and re-anchoring to a different bucket would double-count that delta.
+                    current_bucket_index = target_bucket_index
                     log(
-                        f"Manual brightness change detected: now {current_pct}% - pausing "
-                        f"automatic adjustment for {config.manual_override_cooldown_seconds:.0f}s "
-                        f"(remembering {override_guard.offset_pct:+d}% offset for future adjustments)"
+                        f"Manual brightness change: {current_pct}% (Offset: {override_guard.offset_pct:+d}%) \n"
+                        f"Pausing auto-adjustment ({config.manual_override_cooldown_seconds:.0f}s)"
                     )
-                    notify(f"Manual brightness detected ({current_pct}%), auto-adjust paused", config)
+                    notify(f"Manual brightness change to {current_pct}%. \n Pausing auto-adjustment for {(config.manual_override_cooldown_seconds / 60):.0f} Minutes.", config)
                     continue
 
                 if target_bucket_index == current_bucket_index:
@@ -566,7 +603,7 @@ def run(config: Config) -> None:
                 if not update_gate.enough_time_passed():
                     continue
 
-                target_pct = max(config.min_brightness_pct, min(100, config.buckets[target_bucket_index][2] + override_guard.offset_pct))
+                target_pct = max(config.min_brightness_pct, min(100, target_bucket_pct + override_guard.offset_pct))
 
                 try:
                     monitor.ramp_to(current_pct, target_pct)
