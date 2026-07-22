@@ -25,7 +25,9 @@ mkdir -p "$SERVICE_DIR"
 cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=Lunos - Ambient Light Brightness Daemon
-After=network-online.target
+# plasma-powerdevil.service: start after PowerDevil where it exists (KDE), so the
+# preferred backend is more likely to be up already; ignored on other desktops.
+After=network-online.target plasma-powerdevil.service
 Wants=network-online.target
 
 [Service]

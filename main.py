@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import subprocess
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import NamedTuple, Protocol
 
 
@@ -53,6 +55,14 @@ class Config:
                                        # what makes the brightness applet's slider refresh, since PowerDevil's
                                        # Brightness D-Bus property has no EmitsChangedSignal annotation
 
+    # At login, systemd may start Lunos before PowerDevil has registered org.kde.ScreenBrightness
+    # (or before it has enumerated DDC/CI displays), so the startup detection can miss it and fall
+    # back to ddcutil for the whole run - leaving Plasma's brightness cache out of sync with what
+    # Lunos writes (a later manual +5% key press then jumps from Plasma's stale value). While on
+    # the ddcutil fallback, Lunos re-checks for PowerDevil this often and switches over when it
+    # appears.
+    powerdevil_redetect_interval_seconds: float = 30.0
+
     median_window: int = 3          # number of raw samples in the moving-median filter (swallows single spikes)
 
     # Ramp tuning: each step is a real ddcutil round-trip over DDC/CI (slow, often
@@ -74,6 +84,11 @@ class Config:
     override_poll_interval_seconds: float = 3.0    # how often to check actual vs. tracked brightness
     manual_override_tolerance_pct: int = 3          # mismatch beyond this counts as a manual change
     manual_override_cooldown_seconds: float = 300.0  # how long to pause auto-adjustment afterwards
+
+    # Where the manual-brightness offset survives restarts (state, not config - hence not a
+    # config file but an XDG state file). None disables persistence: the offset then resets
+    # to 0 on every restart, as it did before.
+    offset_state_file: str | None = "~/.local/state/lunos/offset.json"
 
     # If the SSE connection stays open but no valid lux reading arrives for this long
     # (e.g. the sensor is saturated by direct light and stops publishing readings),
@@ -337,6 +352,43 @@ class MonitorController:
         # notification on top of it would just be a redundant second popup.
         self.shows_native_osd = isinstance(self.backend, PowerDevilBackend) and config.powerdevil_show_osd
 
+        # True while we're on the ddcutil fallback but would rather be on PowerDevil -
+        # at login PowerDevil often registers on D-Bus *after* Lunos starts, so the
+        # detection above misses it. maybe_adopt_powerdevil() keeps re-checking.
+        self._powerdevil_pending = config.prefer_powerdevil and not isinstance(self.backend, PowerDevilBackend)
+        self._next_powerdevil_redetect_monotonic = time.monotonic() + config.powerdevil_redetect_interval_seconds
+
+    def maybe_adopt_powerdevil(self, current_pct: int) -> bool:
+        """
+        Rate-limited re-detection of PowerDevil while running on the ddcutil fallback.
+        When it appears, switches the backend over and immediately writes the tracked
+        brightness through PowerDevil once: PowerDevil caches the brightness it read
+        when *it* enumerated the display, so any ddcutil writes Lunos made before the
+        switch left that cache stale - a manual brightness key press would then step
+        from the stale value (e.g. 40% -> 45%) instead of the real one (5% -> 10%).
+        The sync write corrects the cache and Plasma's slider. Returns True on switch.
+        """
+        if not self._powerdevil_pending:
+            return False
+        now = time.monotonic()
+        if now < self._next_powerdevil_redetect_monotonic:
+            return False
+        self._next_powerdevil_redetect_monotonic = now + self._config.powerdevil_redetect_interval_seconds
+
+        backend = PowerDevilBackend.detect(self._config)
+        if backend is None:
+            return False
+
+        self.backend = backend
+        self._powerdevil_pending = False
+        self.shows_native_osd = self._config.powerdevil_show_osd
+        log("PowerDevil appeared on D-Bus; switching brightness backend to it")
+        try:
+            backend.set_pct(current_pct)  # sync PowerDevil's cached value / Plasma's slider
+        except RuntimeError as error:
+            log(f"Could not sync brightness to PowerDevil after switching: {error}")
+        return True
+
     def get_current_brightness_pct(self) -> int | None:
         return self.backend.get_current_pct()
 
@@ -429,8 +481,13 @@ class ManualOverrideGuard:
     would let the reference jump a whole bucket for a small manual nudge, flipping
     the offset's sign even though the user's intent barely changed.
 
-    It's replaced (not accumulated) by the next detected manual change, and only
-    lives for the current run - not saved anywhere, so it resets on restart.
+    It's replaced (not accumulated) by the next detected manual change. When
+    config.offset_state_file is set (the default), the offset is also persisted
+    there on every change and restored at startup, so a standing manual preference
+    (e.g. "always 10% brighter than the table") survives restarts and reboots.
+    Only the offset survives - the override *cooldown* is deliberately not
+    persisted, since "pause auto-adjust for a while" is a reaction to a moment,
+    not a standing preference.
     """
 
     def __init__(self, config: Config, monitor: MonitorController):
@@ -444,7 +501,40 @@ class ManualOverrideGuard:
         # a moment to settle before the guard is allowed to react.
         self._last_poll_monotonic: float = time.monotonic()
         self._override_until_monotonic: float = 0.0
-        self.offset_pct: int = 0
+        self._state_path: Path | None = (
+            Path(config.offset_state_file).expanduser() if config.offset_state_file else None
+        )
+        self.offset_pct: int = self._load_offset()
+        if self.offset_pct:
+            log(f"Restored manual brightness offset: {self.offset_pct:+d}%")
+
+    def _load_offset(self) -> int:
+        """Reads the persisted offset; any problem (missing/corrupt file, wrong type)
+        just means starting from 0, exactly like before persistence existed."""
+        if self._state_path is None:
+            return 0
+        try:
+            offset = json.loads(self._state_path.read_text())["offset_pct"]
+        except (OSError, json.JSONDecodeError, KeyError, TypeError):
+            return 0
+        if not isinstance(offset, int):
+            return 0
+        # A stale file from a different monitor/bucket table could hold a nonsensical
+        # value; brightness percentages bound the sane offset range to (-100, 100).
+        return max(-99, min(99, offset))
+
+    def _save_offset(self) -> None:
+        if self._state_path is None:
+            return
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            # Write-then-rename so a crash mid-write can't leave a truncated file -
+            # os.replace is atomic within the same directory/filesystem.
+            tmp_path = self._state_path.with_suffix(".json.tmp")
+            tmp_path.write_text(json.dumps({"offset_pct": self.offset_pct}))
+            os.replace(tmp_path, self._state_path)
+        except OSError as error:
+            log(f"Could not persist manual brightness offset: {error}")
 
     def active(self) -> bool:
         return time.monotonic() < self._override_until_monotonic
@@ -470,6 +560,7 @@ class ManualOverrideGuard:
         if abs(actual_pct - tracked_pct) > self._config.manual_override_tolerance_pct:
             self._override_until_monotonic = now + self._config.manual_override_cooldown_seconds
             self.offset_pct = actual_pct - ambient_target_pct
+            self._save_offset()
             return actual_pct
 
         return None
@@ -569,6 +660,9 @@ def run(config: Config) -> None:
             for raw_lux in read_ambient_lux_values(config):
                 if median_filter.sample_count == 0:
                     log("Connected, waiting for lux values.")
+
+                # PowerDevil may have started after us (login race) - upgrade to it when it shows up.
+                monitor.maybe_adopt_powerdevil(current_pct)
 
                 smoothed_lux = median_filter.add_reading(raw_lux)
                 target_bucket_index = select_bucket_index(config.buckets, smoothed_lux, current_bucket_index)

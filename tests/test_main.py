@@ -14,10 +14,15 @@ hardware, so no monitor, sensor, busctl, or ddcutil is required.
 
 from __future__ import annotations
 
+import json
+import tempfile
 import time
 import unittest
 from dataclasses import replace
+from pathlib import Path
+from unittest import mock
 
+import main
 from main import (
     Bucket,
     BrightnessUpdateGate,
@@ -165,6 +170,8 @@ class TestBrightnessUpdateGate(unittest.TestCase):
 class TestManualOverrideGuard(unittest.TestCase):
     def _guard(self, monitor, **overrides) -> ManualOverrideGuard:
         # poll interval 0 so every check() actually polls, tolerance 3 as in defaults.
+        # Persistence off so these tests never touch the developer's real state file.
+        overrides.setdefault("offset_state_file", None)
         cfg = replace(Config(), override_poll_interval_seconds=0.0, **overrides)
         return ManualOverrideGuard(cfg, monitor)
 
@@ -201,7 +208,7 @@ class TestManualOverrideGuard(unittest.TestCase):
 
     def test_poll_is_rate_limited(self):
         # Default 3s interval: the guard was just constructed, so a check now is too soon.
-        guard = ManualOverrideGuard(Config(), FakeMonitor(40))
+        guard = ManualOverrideGuard(replace(Config(), offset_state_file=None), FakeMonitor(40))
         self.assertIsNone(guard.check(tracked_pct=35, ambient_target_pct=35))
 
     def test_unreadable_brightness_is_ignored(self):
@@ -214,6 +221,57 @@ class TestManualOverrideGuard(unittest.TestCase):
         guard.check(tracked_pct=35, ambient_target_pct=35)
         # A zero-length cooldown is already in the past.
         self.assertFalse(guard.active())
+
+
+class TestOffsetPersistence(unittest.TestCase):
+    """The manual offset survives restarts via the offset_state_file; the cooldown doesn't."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.state_file = Path(self._tmp.name) / "offset.json"
+
+    def _guard(self, monitor, **overrides) -> ManualOverrideGuard:
+        overrides.setdefault("offset_state_file", str(self.state_file))
+        cfg = replace(Config(), override_poll_interval_seconds=0.0, **overrides)
+        return ManualOverrideGuard(cfg, monitor)
+
+    def test_offset_survives_restart(self):
+        first_run = self._guard(FakeMonitor(45))
+        first_run.check(tracked_pct=35, ambient_target_pct=35)  # manual change -> offset +10
+        self.assertEqual(first_run.offset_pct, 10)
+
+        second_run = self._guard(FakeMonitor(45))  # fresh guard = restarted daemon
+        self.assertEqual(second_run.offset_pct, 10)
+        # Cooldown is a reaction to a moment, not a preference - it must NOT survive.
+        self.assertFalse(second_run.active())
+
+    def test_next_manual_change_replaces_persisted_offset(self):
+        self._guard(FakeMonitor(45)).check(tracked_pct=35, ambient_target_pct=35)  # +10
+        restarted = self._guard(FakeMonitor(30))
+        restarted.check(tracked_pct=35, ambient_target_pct=35)  # -5
+        self.assertEqual(self._guard(FakeMonitor(30)).offset_pct, -5)
+
+    def test_missing_file_starts_at_zero(self):
+        self.assertEqual(self._guard(FakeMonitor(35)).offset_pct, 0)
+        self.assertFalse(self.state_file.exists())  # nothing saved until a change happens
+
+    def test_corrupt_file_starts_at_zero(self):
+        self.state_file.write_text("{not json")
+        self.assertEqual(self._guard(FakeMonitor(35)).offset_pct, 0)
+
+    def test_wrong_shape_starts_at_zero(self):
+        self.state_file.write_text(json.dumps({"offset_pct": "ten"}))
+        self.assertEqual(self._guard(FakeMonitor(35)).offset_pct, 0)
+
+    def test_nonsensical_persisted_value_is_clamped(self):
+        self.state_file.write_text(json.dumps({"offset_pct": 400}))
+        self.assertEqual(self._guard(FakeMonitor(35)).offset_pct, 99)
+
+    def test_none_path_disables_persistence(self):
+        guard = self._guard(FakeMonitor(45), offset_state_file=None)
+        guard.check(tracked_pct=35, ambient_target_pct=35)
+        self.assertFalse(self.state_file.exists())
 
 
 # --------------------------------------------------------------------------- #
@@ -257,6 +315,83 @@ class TestRampTo(unittest.TestCase):
         self._controller(backend).ramp_to(100, 20)
         self.assertEqual(backend.writes[-1], 20)
         self.assertTrue(all(a > b for a, b in zip(backend.writes, backend.writes[1:])))
+
+
+# --------------------------------------------------------------------------- #
+# Late PowerDevil adoption (login race)
+# --------------------------------------------------------------------------- #
+
+class TestMaybeAdoptPowerDevil(unittest.TestCase):
+    """
+    Regression for the login race: systemd can start Lunos before PowerDevil has
+    registered on D-Bus, so the one-shot startup detection falls back to ddcutil
+    for the whole run. The controller must keep re-checking and switch over (and
+    sync the tracked brightness into PowerDevil) once it appears.
+    """
+
+    def _fallback_controller(self, **overrides) -> MonitorController:
+        # Detection finds nothing at startup -> controller lands on the ddcutil fallback.
+        overrides.setdefault("powerdevil_redetect_interval_seconds", 0.0)
+        cfg = replace(Config(), **overrides)
+        with mock.patch.object(main.PowerDevilBackend, "detect", return_value=None):
+            return MonitorController(cfg)
+
+    def test_adopts_powerdevil_and_syncs_tracked_brightness(self):
+        controller = self._fallback_controller()
+        fake_powerdevil = RecordingBackend(supports_ramping=False)
+        with mock.patch.object(main.PowerDevilBackend, "detect", return_value=fake_powerdevil):
+            self.assertTrue(controller.maybe_adopt_powerdevil(current_pct=5))
+        self.assertIs(controller.backend, fake_powerdevil)
+        # The sync write is the fix for the stale-cache jump (manual +5% stepping
+        # from PowerDevil's remembered 40% instead of the real 5%).
+        self.assertEqual(fake_powerdevil.writes, [5])
+        self.assertTrue(controller.shows_native_osd)
+
+    def test_no_switch_while_powerdevil_still_absent(self):
+        controller = self._fallback_controller()
+        with mock.patch.object(main.PowerDevilBackend, "detect", return_value=None):
+            self.assertFalse(controller.maybe_adopt_powerdevil(current_pct=5))
+        self.assertIsInstance(controller.backend, main.DdcutilBackend)
+        self.assertFalse(controller.shows_native_osd)
+
+    def test_redetect_is_rate_limited(self):
+        controller = self._fallback_controller(powerdevil_redetect_interval_seconds=10_000.0)
+        with mock.patch.object(main.PowerDevilBackend, "detect") as detect:
+            # Interval seeded at construction time, so the first re-check is still too soon.
+            self.assertFalse(controller.maybe_adopt_powerdevil(current_pct=5))
+        detect.assert_not_called()
+
+    def test_never_redetects_when_powerdevil_not_preferred(self):
+        controller = self._fallback_controller(prefer_powerdevil=False)
+        with mock.patch.object(main.PowerDevilBackend, "detect") as detect:
+            self.assertFalse(controller.maybe_adopt_powerdevil(current_pct=5))
+        detect.assert_not_called()
+
+    def test_stops_redetecting_after_adoption(self):
+        controller = self._fallback_controller()
+        fake_powerdevil = RecordingBackend(supports_ramping=False)
+        with mock.patch.object(main.PowerDevilBackend, "detect", return_value=fake_powerdevil):
+            controller.maybe_adopt_powerdevil(current_pct=5)
+        with mock.patch.object(main.PowerDevilBackend, "detect") as detect:
+            self.assertFalse(controller.maybe_adopt_powerdevil(current_pct=5))
+        detect.assert_not_called()
+
+    def test_failed_sync_write_still_switches_backend(self):
+        controller = self._fallback_controller()
+
+        class FailingBackend:
+            supports_ramping = False
+
+            def set_pct(self, pct: int) -> None:
+                raise RuntimeError("SetBrightness failed")
+
+            def get_current_pct(self) -> int | None:
+                return None
+
+        failing = FailingBackend()
+        with mock.patch.object(main.PowerDevilBackend, "detect", return_value=failing):
+            self.assertTrue(controller.maybe_adopt_powerdevil(current_pct=5))
+        self.assertIs(controller.backend, failing)
 
 
 # --------------------------------------------------------------------------- #

@@ -91,6 +91,7 @@ There's no external config file — every setting lives in the `Config` dataclas
 | `prefer_powerdevil` | Use KDE PowerDevil when available instead of ddcutil directly (see [Design notes](#design-notes)) |
 | `powerdevil_display_label_contains` | Optional substring to pick a specific external display under PowerDevil; defaults to the first non-internal one |
 | `powerdevil_show_osd` | Show Plasma's own brightness OSD for Lunos's automatic changes too (also what makes the brightness applet's slider stay in sync); only used by the PowerDevil backend. When enabled, the desktop notification on brightness change is skipped too, since the OSD already shows it |
+| `powerdevil_redetect_interval_seconds` | While on the ddcutil fallback (with `prefer_powerdevil` on), how often to re-check for PowerDevil — at login it may register on D-Bus only after Lunos has already started; Lunos switches over (and syncs its tracked brightness into PowerDevil) as soon as it appears |
 | `buckets` | The lux-to-brightness bucket table (see [Design notes](#design-notes)); tune to your own room/monitor |
 | `default_bucket_index` | Bucket to assume at cold boot if the monitor's current brightness can't be read |
 | `median_window` | Raw samples used for outlier suppression |
@@ -102,6 +103,7 @@ There's no external config file — every setting lives in the `Config` dataclas
 | `connection_timeout_seconds` | Connect + read timeout for the SSE HTTP request |
 | `override_poll_interval_seconds` / `manual_override_tolerance_pct` | How often, and how sensitively, to check for a manual brightness change |
 | `manual_override_cooldown_seconds` | How long to pause auto-adjustment after a manual change is detected |
+| `offset_state_file` | Where the manual-brightness offset is persisted across restarts (see [Design notes](#design-notes)); `None` disables persistence |
 | `notifications_enabled` | Toggle desktop notifications |
 | `notification_timeout_ms` | How long a desktop notification stays visible |
 
@@ -125,7 +127,13 @@ restructured its own DDC handling to avoid.
 `powerdevil_display_label_contains`, if set); if found, brightness changes go through PowerDevil,
 so Plasma's own UI/OSD is always accurate — it's the one making the change. Otherwise
 (`prefer_powerdevil = False`, no Plasma, `busctl` missing, or no matching display), it falls back
-to `DdcutilBackend`, calling `ddcutil` directly as before. D-Bus calls go through `busctl` (ships
+to `DdcutilBackend`, calling `ddcutil` directly as before. The fallback isn't final: at login,
+systemd can start Lunos before PowerDevil has registered on D-Bus (or before it has enumerated its
+DDC/CI displays), so while on the ddcutil fallback Lunos re-runs the detection every
+`powerdevil_redetect_interval_seconds` and switches over once PowerDevil appears — writing its
+tracked brightness through PowerDevil once on switch, since PowerDevil caches the brightness it
+read at its own display enumeration and any earlier direct ddcutil writes would leave that cache
+(and Plasma's brightness keys, which step from it) stale. D-Bus calls go through `busctl` (ships
 with `systemd`, no extra dependency) rather than a Python D-Bus binding, to avoid adding a
 dependency that's only needed on one of the two paths.
 
@@ -210,8 +218,12 @@ The mismatch also sets a standing `offset_pct` (the difference between your manu
 the current bucket's raw table target), which every future automatic adjustment adds on top of its
 own target, clamped to 0–100%. If you consistently nudge the brightness a bit brighter or dimmer
 than what Lunos picks, later bucket changes track that preference instead of reverting to the bare
-table values each time. The offset is replaced (not accumulated) by the next manual change, and
-only lives for the current run of the daemon — it isn't saved to disk, so it resets on restart.
+table values each time. The offset is replaced (not accumulated) by the next manual change, and is
+persisted to `offset_state_file` (default `~/.local/state/lunos/offset.json`) on every change, so
+it survives restarts and reboots. Only the offset is persisted — the override *cooldown* isn't,
+since pausing auto-adjustment is a reaction to a moment, not a standing preference. Set
+`offset_state_file = None` to disable persistence (the offset then resets on restart, as before);
+delete the file to reset a saved offset.
 
 ## License
 
