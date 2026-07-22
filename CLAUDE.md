@@ -9,7 +9,7 @@ Lunos is a single-file Python daemon (`main.py`) that reads lux values from a Lu
 ## Commands
 
 ```sh
-./install.sh                                   # create venv/, pip install requirements, register + start the systemd user service
+./install.sh                                   # create venv/, pip install requirements, register + (re)start the systemd user service
 venv/bin/python3 main.py                        # run directly in the foreground (useful for iterating; watch stdout logs)
 systemctl --user status lunos.service           # service status
 journalctl --user -u lunos.service -f           # follow live logs
@@ -17,7 +17,7 @@ systemctl --user restart lunos.service          # apply changes after editing ma
 venv/bin/python3 -m unittest tests.test_main -v   # run the unit tests (from the repo root)
 ```
 
-There is no build or lint tooling. `install.sh` is idempotent: it reuses an existing `venv/` and rewrites the unit file each run.
+There is no build or lint tooling. `install.sh` is idempotent: it reuses an existing `venv/`, rewrites the unit file, and restarts the service each run — so re-running it also applies changes to `main.py`.
 
 **Run the tests after every change to `main.py`** (`venv/bin/python3 -m unittest tests.test_main`, from the repo root) and confirm they pass before considering the change done. `tests/test_main.py` uses fakes for the monitor and sensor, so it needs no hardware, `busctl`, or `ddcutil` — but it does import `main`, so run it through the venv (which has `requests`/`sseclient`). When you change or add behavior, add or update the corresponding test in the same edit.
 
