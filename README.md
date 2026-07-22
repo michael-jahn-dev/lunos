@@ -54,6 +54,9 @@ and own yourself.
 This creates a Python venv in `venv/`, installs the dependencies from `requirements.txt`, and
 registers + starts a systemd user service (`lunos.service`) that restarts automatically.
 
+Re-running it is safe and idempotent: it reuses the existing venv, rewrites the unit file, and
+restarts the service — so a re-run also applies any changes you've made to `main.py`.
+
 ## Usage
 
 ```sh

@@ -38,7 +38,9 @@ WantedBy=default.target
 EOF
 
 systemctl --user daemon-reload
-systemctl --user enable --now lunos.service
+systemctl --user enable lunos.service
+# restart (not just start) so a re-run picks up changes to main.py in an already-running service
+systemctl --user restart lunos.service
 
 echo ""
 echo "Lunos is running. Check status with:"
