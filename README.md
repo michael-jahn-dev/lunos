@@ -63,6 +63,18 @@ systemctl --user stop lunos.service        # stop it
 systemctl --user disable lunos.service     # stop it from starting on login
 ```
 
+## Tests
+
+The core logic (bucket curve, median filter, manual-override guard, ramping) is covered by a
+`unittest` suite in `test_main.py`. It uses fakes for the monitor and sensor, so no hardware,
+`busctl`, or `ddcutil` is needed. Run it with the project venv (the tests import `main`, which
+pulls in `requests`/`sseclient`):
+
+```sh
+venv/bin/python3 -m unittest test_main -v     # verbose
+venv/bin/python3 -m unittest test_main        # quiet
+```
+
 ## Configuration
 
 There's no external config file — every setting lives in the `Config` dataclass at the top of
