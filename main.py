@@ -358,36 +358,66 @@ class MonitorController:
         self._powerdevil_pending = config.prefer_powerdevil and not isinstance(self.backend, PowerDevilBackend)
         self._next_powerdevil_redetect_monotonic = time.monotonic() + config.powerdevil_redetect_interval_seconds
 
-    def maybe_adopt_powerdevil(self, current_pct: int) -> bool:
+        # Whether Lunos has itself applied a brightness change yet. Until it has, the value it
+        # "tracks" is only the monitor's power-on reading it happened to observe at startup -
+        # not something it authored, and on Plasma not authoritative (PowerDevil overwrites it
+        # with its own remembered brightness at login). This decides, on PowerDevil adoption,
+        # whether to push our value onto PowerDevil (we authored it) or adopt PowerDevil's.
+        self._applied_write = False
+
+    def maybe_adopt_powerdevil(self, current_pct: int, force: bool = False) -> int | None:
         """
-        Rate-limited re-detection of PowerDevil while running on the ddcutil fallback.
-        When it appears, switches the backend over and immediately writes the tracked
-        brightness through PowerDevil once: PowerDevil caches the brightness it read
-        when *it* enumerated the display, so any ddcutil writes Lunos made before the
-        switch left that cache stale - a manual brightness key press would then step
-        from the stale value (e.g. 40% -> 45%) instead of the real one (5% -> 10%).
-        The sync write corrects the cache and Plasma's slider. Returns True on switch.
+        Re-detects PowerDevil while running on the ddcutil fallback and switches over when it
+        appears. Returns the brightness percentage the caller should now treat as current (so
+        it can re-anchor), or None if no switch happened.
+
+        Two adoption cases, decided by whether Lunos has authored the current brightness:
+
+        - We already applied a ddcutil write (self._applied_write): our tracked value is the
+          real one. PowerDevil may hold a stale value cached from when it enumerated the
+          display, so push ours onto it - otherwise Plasma's slider and a later manual +5%
+          would step from the stale value (e.g. 40% -> 45%) instead of reality (5% -> 10%).
+
+        - We have not written anything yet: our tracked value is only the monitor's power-on
+          reading, which PowerDevil (the brightness authority on Plasma) may already have
+          overwritten with its own remembered brightness at login. Adopt PowerDevil's actual
+          value as the truth instead of forcing our stale observation onto it.
+
+        Normally rate-limited to config.powerdevil_redetect_interval_seconds; pass force=True
+        to bypass that. The main loop forces a re-check the moment it sees the monitor diverge
+        from our tracked value, since PowerDevil's DDC write and its D-Bus registration are the
+        same arrival event - so a divergence on the fallback is often PowerDevil taking over,
+        not the user, and PowerDevil is detectable at that instant.
         """
         if not self._powerdevil_pending:
-            return False
+            return None
         now = time.monotonic()
-        if now < self._next_powerdevil_redetect_monotonic:
-            return False
+        if not force and now < self._next_powerdevil_redetect_monotonic:
+            return None
         self._next_powerdevil_redetect_monotonic = now + self._config.powerdevil_redetect_interval_seconds
 
         backend = PowerDevilBackend.detect(self._config)
         if backend is None:
-            return False
+            return None
 
         self.backend = backend
         self._powerdevil_pending = False
         self.shows_native_osd = self._config.powerdevil_show_osd
         log("PowerDevil appeared on D-Bus; switching brightness backend to it")
-        try:
-            backend.set_pct(current_pct)  # sync PowerDevil's cached value / Plasma's slider
-        except RuntimeError as error:
-            log(f"Could not sync brightness to PowerDevil after switching: {error}")
-        return True
+
+        if self._applied_write:
+            try:
+                backend.set_pct(current_pct)  # correct PowerDevil's stale cache / Plasma's slider
+            except RuntimeError as error:
+                log(f"Could not sync brightness to PowerDevil after switching: {error}")
+            return current_pct
+
+        adopted = backend.get_current_pct()
+        if adopted is None:
+            return current_pct
+        if adopted != current_pct:
+            log(f"Re-anchoring tracked brightness to PowerDevil: {current_pct}% -> {adopted}%")
+        return adopted
 
     def get_current_brightness_pct(self) -> int | None:
         return self.backend.get_current_pct()
@@ -405,6 +435,10 @@ class MonitorController:
         delta = to_pct - from_pct
         if delta == 0:
             return
+
+        # From here a write is guaranteed: our tracked brightness is now self-authored, so a
+        # later PowerDevil adoption should push this value rather than adopt PowerDevil's.
+        self._applied_write = True
 
         if not self.backend.supports_ramping:
             self.backend.set_pct(to_pct)
@@ -539,14 +573,16 @@ class ManualOverrideGuard:
     def active(self) -> bool:
         return time.monotonic() < self._override_until_monotonic
 
-    def check(self, tracked_pct: int, ambient_target_pct: int) -> int | None:
+    def poll_actual(self, tracked_pct: int) -> int | None:
         """
-        Rate-limited poll of the monitor's actual brightness. Returns the actual
-        percentage (and starts/refreshes the cooldown, and recomputes offset_pct
-        as the manual value's delta from ambient_target_pct - the target of the
-        bucket the ambient light currently selects, which is the same bucket the
-        offset is later added back to) if it no longer matches tracked_pct, or
-        None if nothing changed or it isn't time to poll yet.
+        Rate-limited read of the monitor's actual brightness. Returns it when it has
+        diverged from tracked_pct beyond tolerance (a change made outside our last
+        write), or None if nothing changed or it isn't time to poll yet.
+
+        Pure detection - records no offset or cooldown. The caller decides whether the
+        change is really the user's (then calls record_override) or another controller
+        taking over (e.g. PowerDevil at login), which must not be recorded as a manual
+        override.
         """
         now = time.monotonic()
         if now - self._last_poll_monotonic < self._config.override_poll_interval_seconds:
@@ -556,14 +592,31 @@ class ManualOverrideGuard:
         actual_pct = self._monitor.get_current_brightness_pct()
         if actual_pct is None:
             return None
+        if abs(actual_pct - tracked_pct) <= self._config.manual_override_tolerance_pct:
+            return None
+        return actual_pct
 
-        if abs(actual_pct - tracked_pct) > self._config.manual_override_tolerance_pct:
-            self._override_until_monotonic = now + self._config.manual_override_cooldown_seconds
-            self.offset_pct = actual_pct - ambient_target_pct
-            self._save_offset()
-            return actual_pct
+    def record_override(self, actual_pct: int, ambient_target_pct: int) -> None:
+        """
+        Registers a confirmed manual brightness change: pause auto-adjustment for the
+        cooldown and remember the standing offset (actual minus ambient_target_pct - the
+        target of the bucket the ambient light currently selects, which is the same bucket
+        the offset is later added back to).
+        """
+        self._override_until_monotonic = time.monotonic() + self._config.manual_override_cooldown_seconds
+        self.offset_pct = actual_pct - ambient_target_pct
+        self._save_offset()
 
-        return None
+    def check(self, tracked_pct: int, ambient_target_pct: int) -> int | None:
+        """
+        Convenience: poll and, on a detected change, record it as a manual override.
+        The main loop instead calls poll_actual/record_override separately so it can
+        re-check for a PowerDevil handoff in between.
+        """
+        actual_pct = self.poll_actual(tracked_pct)
+        if actual_pct is not None:
+            self.record_override(actual_pct, ambient_target_pct)
+        return actual_pct
 
 
 # --------------------------------------------------------------------------- #
@@ -661,8 +714,12 @@ def run(config: Config) -> None:
                 if median_filter.sample_count == 0:
                     log("Connected, waiting for lux values.")
 
-                # PowerDevil may have started after us (login race) - upgrade to it when it shows up.
-                monitor.maybe_adopt_powerdevil(current_pct)
+                # PowerDevil may have started after us (login race) - upgrade to it when it shows
+                # up, re-anchoring our tracked brightness to whatever it reports.
+                adopted_pct = monitor.maybe_adopt_powerdevil(current_pct)
+                if adopted_pct is not None:
+                    current_pct = adopted_pct
+                    current_bucket_index = nearest_bucket_index_for_pct(config.buckets, current_pct)
 
                 smoothed_lux = median_filter.add_reading(raw_lux)
                 target_bucket_index = select_bucket_index(config.buckets, smoothed_lux, current_bucket_index)
@@ -675,10 +732,23 @@ def run(config: Config) -> None:
                     f"| Offset: {override_guard.offset_pct:+d}%"
                 )
 
-                override_pct = override_guard.check(current_pct, target_bucket_pct)
+                actual_pct = override_guard.poll_actual(current_pct)
 
-                if override_pct is not None:
-                    current_pct = override_pct
+                if actual_pct is not None:
+                    # The monitor diverged from what we track. On the ddcutil fallback this is
+                    # often PowerDevil taking over at login (its DDC write and its D-Bus
+                    # registration are the same arrival event), not the user - so re-check for
+                    # PowerDevil right now, before recording a manual override, and adopt it if
+                    # present, re-anchoring to its value instead of blaming the user.
+                    adopted_pct = monitor.maybe_adopt_powerdevil(current_pct, force=True)
+                    if adopted_pct is not None:
+                        current_pct = adopted_pct
+                        current_bucket_index = nearest_bucket_index_for_pct(config.buckets, current_pct)
+                        continue
+
+                    # Genuinely external - treat as a manual override.
+                    override_guard.record_override(actual_pct, target_bucket_pct)
+                    current_pct = actual_pct
                     # Anchor to the ambient-selected bucket, not the bucket nearest the manual
                     # brightness: the offset now carries the manual delta relative to this bucket,
                     # and re-anchoring to a different bucket would double-count that delta.

@@ -52,17 +52,23 @@ class FakeMonitor:
 
 
 class RecordingBackend:
-    """Backend double that just records every set_pct it receives."""
+    """Backend double that records every set_pct and reports a current brightness.
 
-    def __init__(self, supports_ramping: bool):
+    `current` is what it reports before anything is written (e.g. PowerDevil's own
+    remembered brightness, already applied when Lunos adopts it); once written, the
+    last write wins.
+    """
+
+    def __init__(self, supports_ramping: bool, current: int | None = None):
         self.supports_ramping = supports_ramping
         self.writes: list[int] = []
+        self._current = current
 
     def set_pct(self, pct: int) -> None:
         self.writes.append(pct)
 
     def get_current_pct(self) -> int | None:
-        return self.writes[-1] if self.writes else None
+        return self.writes[-1] if self.writes else self._current
 
 
 # --------------------------------------------------------------------------- #
@@ -222,6 +228,24 @@ class TestManualOverrideGuard(unittest.TestCase):
         # A zero-length cooldown is already in the past.
         self.assertFalse(guard.active())
 
+    def test_poll_actual_detects_without_side_effects(self):
+        # Detection alone must not record an offset or start a cooldown - that's the caller's
+        # call (the change might be PowerDevil taking over, not the user).
+        guard = self._guard(FakeMonitor(45))
+        self.assertEqual(guard.poll_actual(tracked_pct=35), 45)
+        self.assertEqual(guard.offset_pct, 0)
+        self.assertFalse(guard.active())
+
+    def test_poll_actual_returns_none_within_tolerance(self):
+        guard = self._guard(FakeMonitor(38))  # diff 3 == tolerance
+        self.assertIsNone(guard.poll_actual(tracked_pct=35))
+
+    def test_record_override_sets_offset_and_cooldown(self):
+        guard = self._guard(FakeMonitor(45))
+        guard.record_override(actual_pct=45, ambient_target_pct=35)
+        self.assertEqual(guard.offset_pct, 10)
+        self.assertTrue(guard.active())
+
 
 class TestOffsetPersistence(unittest.TestCase):
     """The manual offset survives restarts via the offset_state_file; the cooldown doesn't."""
@@ -336,21 +360,34 @@ class TestMaybeAdoptPowerDevil(unittest.TestCase):
         with mock.patch.object(main.PowerDevilBackend, "detect", return_value=None):
             return MonitorController(cfg)
 
-    def test_adopts_powerdevil_and_syncs_tracked_brightness(self):
+    def test_adopts_powerdevils_value_when_lunos_has_not_written(self):
+        # Boot case: Lunos never applied a brightness itself, so its tracked value (5) is only
+        # the power-on reading it observed. PowerDevil, the authority on Plasma, already holds
+        # its own remembered brightness (40). Adoption must re-anchor to PowerDevil's 40, not
+        # push the stale 5 onto it - and record no false manual override.
         controller = self._fallback_controller()
-        fake_powerdevil = RecordingBackend(supports_ramping=False)
+        fake_powerdevil = RecordingBackend(supports_ramping=False, current=40)
         with mock.patch.object(main.PowerDevilBackend, "detect", return_value=fake_powerdevil):
-            self.assertTrue(controller.maybe_adopt_powerdevil(current_pct=5))
+            self.assertEqual(controller.maybe_adopt_powerdevil(current_pct=5), 40)
         self.assertIs(controller.backend, fake_powerdevil)
-        # The sync write is the fix for the stale-cache jump (manual +5% stepping
-        # from PowerDevil's remembered 40% instead of the real 5%).
-        self.assertEqual(fake_powerdevil.writes, [5])
+        self.assertEqual(fake_powerdevil.writes, [])  # no push - we adopt its value
         self.assertTrue(controller.shows_native_osd)
+
+    def test_pushes_tracked_value_when_lunos_authored_it(self):
+        # Once Lunos has applied a ddcutil write, its tracked value is the real one and
+        # PowerDevil's cache may be stale, so adoption pushes ours (the stale-cache fix:
+        # a later manual +5% steps from 5 -> 10, not from PowerDevil's remembered 40 -> 45).
+        controller = self._fallback_controller()
+        controller._applied_write = True
+        fake_powerdevil = RecordingBackend(supports_ramping=False, current=40)
+        with mock.patch.object(main.PowerDevilBackend, "detect", return_value=fake_powerdevil):
+            self.assertEqual(controller.maybe_adopt_powerdevil(current_pct=5), 5)
+        self.assertEqual(fake_powerdevil.writes, [5])
 
     def test_no_switch_while_powerdevil_still_absent(self):
         controller = self._fallback_controller()
         with mock.patch.object(main.PowerDevilBackend, "detect", return_value=None):
-            self.assertFalse(controller.maybe_adopt_powerdevil(current_pct=5))
+            self.assertIsNone(controller.maybe_adopt_powerdevil(current_pct=5))
         self.assertIsInstance(controller.backend, main.DdcutilBackend)
         self.assertFalse(controller.shows_native_osd)
 
@@ -358,26 +395,35 @@ class TestMaybeAdoptPowerDevil(unittest.TestCase):
         controller = self._fallback_controller(powerdevil_redetect_interval_seconds=10_000.0)
         with mock.patch.object(main.PowerDevilBackend, "detect") as detect:
             # Interval seeded at construction time, so the first re-check is still too soon.
-            self.assertFalse(controller.maybe_adopt_powerdevil(current_pct=5))
+            self.assertIsNone(controller.maybe_adopt_powerdevil(current_pct=5))
         detect.assert_not_called()
+
+    def test_force_bypasses_rate_limit(self):
+        # A mismatch on the fallback forces an immediate re-check regardless of the interval.
+        controller = self._fallback_controller(powerdevil_redetect_interval_seconds=10_000.0)
+        fake_powerdevil = RecordingBackend(supports_ramping=False, current=40)
+        with mock.patch.object(main.PowerDevilBackend, "detect", return_value=fake_powerdevil):
+            self.assertEqual(controller.maybe_adopt_powerdevil(current_pct=5, force=True), 40)
+        self.assertIs(controller.backend, fake_powerdevil)
 
     def test_never_redetects_when_powerdevil_not_preferred(self):
         controller = self._fallback_controller(prefer_powerdevil=False)
         with mock.patch.object(main.PowerDevilBackend, "detect") as detect:
-            self.assertFalse(controller.maybe_adopt_powerdevil(current_pct=5))
+            self.assertIsNone(controller.maybe_adopt_powerdevil(current_pct=5, force=True))
         detect.assert_not_called()
 
     def test_stops_redetecting_after_adoption(self):
         controller = self._fallback_controller()
-        fake_powerdevil = RecordingBackend(supports_ramping=False)
+        fake_powerdevil = RecordingBackend(supports_ramping=False, current=40)
         with mock.patch.object(main.PowerDevilBackend, "detect", return_value=fake_powerdevil):
             controller.maybe_adopt_powerdevil(current_pct=5)
         with mock.patch.object(main.PowerDevilBackend, "detect") as detect:
-            self.assertFalse(controller.maybe_adopt_powerdevil(current_pct=5))
+            self.assertIsNone(controller.maybe_adopt_powerdevil(current_pct=5, force=True))
         detect.assert_not_called()
 
-    def test_failed_sync_write_still_switches_backend(self):
+    def test_failed_push_still_switches_backend(self):
         controller = self._fallback_controller()
+        controller._applied_write = True  # so adoption takes the push path
 
         class FailingBackend:
             supports_ramping = False
@@ -390,7 +436,7 @@ class TestMaybeAdoptPowerDevil(unittest.TestCase):
 
         failing = FailingBackend()
         with mock.patch.object(main.PowerDevilBackend, "detect", return_value=failing):
-            self.assertTrue(controller.maybe_adopt_powerdevil(current_pct=5))
+            self.assertEqual(controller.maybe_adopt_powerdevil(current_pct=5), 5)
         self.assertIs(controller.backend, failing)
 
 
