@@ -14,8 +14,13 @@ hardware, so no monitor, sensor, busctl, or ddcutil is required.
 
 from __future__ import annotations
 
+import atexit
+import itertools
 import json
+import os
+import shutil
 import tempfile
+import threading
 import time
 import unittest
 from dataclasses import replace
@@ -69,6 +74,63 @@ class RecordingBackend:
 
     def get_current_pct(self) -> int | None:
         return self.writes[-1] if self.writes else self._current
+
+    def set_config(self, config: Config) -> None:
+        self.config = config
+
+
+class FakeMonitorController:
+    """Stands in for MonitorController inside a Daemon: no backend, no subprocesses."""
+
+    shows_native_osd = False
+    backend_name = "ddcutil"
+    powerdevil_pending = False
+
+    def __init__(self, current: int | None = None, adopts: int | None = None):
+        self.current = current
+        self.writes: list[int] = []
+        self.configs: list[Config] = []
+        self._adopts = adopts  # value a simulated PowerDevil adoption re-anchors to
+
+    def get_current_brightness_pct(self) -> int | None:
+        return self.current
+
+    def maybe_adopt_powerdevil(self, current_pct: int, force: bool = False) -> int | None:
+        adopted, self._adopts = self._adopts, None
+        return adopted
+
+    def ramp_to(self, from_pct: int, to_pct: int) -> None:
+        self.writes.append(to_pct)
+        self.current = to_pct
+
+    def set_config(self, config: Config) -> int | None:
+        self.configs.append(config)
+        return None
+
+
+# Throwaway config file for every Daemon built here. A Daemon with config_path=None
+# persists set_config to config_file_path(None) - i.e. the *user's real*
+# ~/.config/lunos/config.json. A test suite must never write there: it would hand a
+# running daemon this file's fixture values (a one-bucket curve, notifications off)
+# the next time it started.
+_TEST_CONFIG_DIR = tempfile.mkdtemp(prefix="lunos-tests-")
+_TEST_CONFIG_COUNTER = itertools.count()
+atexit.register(shutil.rmtree, _TEST_CONFIG_DIR, True)
+
+
+def make_daemon(monitor: FakeMonitorController | None = None, **overrides) -> main.Daemon:
+    """A Daemon wired to a fake monitor, with persistence and notifications off and
+    the rate gate open, so tests exercise decisions rather than side effects."""
+    overrides.setdefault("offset_state_file", None)
+    overrides.setdefault("notifications_enabled", False)
+    overrides.setdefault("min_seconds_between_updates", 0.0)
+    overrides.setdefault("override_poll_interval_seconds", 10_000.0)  # no manual-change polling unless asked
+    monitor = monitor or FakeMonitorController(current=20)
+    config_path = Path(_TEST_CONFIG_DIR) / f"config-{next(_TEST_CONFIG_COUNTER)}.json"
+    with mock.patch.object(main, "MonitorController", return_value=monitor):
+        daemon = main.Daemon(replace(Config(), **overrides), config_path=config_path)
+    daemon.anchor_to_monitor()
+    return daemon
 
 
 # --------------------------------------------------------------------------- #
@@ -448,6 +510,497 @@ class TestBucket(unittest.TestCase):
     def test_named_and_positional_access_agree(self):
         b = Bucket(15, 100, 35)
         self.assertEqual((b.min_lux, b.max_lux, b.brightness_pct), (b[0], b[1], b[2]))
+
+
+# --------------------------------------------------------------------------- #
+# Config file overlay
+# --------------------------------------------------------------------------- #
+
+class TestFieldSpecs(unittest.TestCase):
+    def test_every_config_field_has_a_spec(self):
+        # A field without a spec can't be validated, shown in the settings window, or
+        # classified in the apply matrix - it would silently be un-configurable.
+        from dataclasses import fields as dataclass_fields
+
+        self.assertEqual(
+            {f.name for f in dataclass_fields(Config)},
+            set(main.FIELD_SPECS),
+        )
+
+    def test_apply_classes_are_known(self):
+        for name, spec in main.FIELD_SPECS.items():
+            self.assertIn(spec.apply, ("hot", "reconnect", "restart"), name)
+
+
+class TestConfigValidation(unittest.TestCase):
+    def test_unknown_field_is_rejected(self):
+        with self.assertRaises(main.ConfigFieldError):
+            main.coerce_config_value("rm_rf", "yes")
+
+    def test_type_mismatch_is_rejected(self):
+        with self.assertRaises(main.ConfigFieldError):
+            main.coerce_config_value("median_window", "three")
+        with self.assertRaises(main.ConfigFieldError):
+            main.coerce_config_value("notifications_enabled", 1)
+
+    def test_bool_is_not_accepted_as_a_number(self):
+        # bool is an int subclass, so this would otherwise sail through as 1.
+        with self.assertRaises(main.ConfigFieldError):
+            main.coerce_config_value("override_poll_interval_seconds", True)
+
+    def test_range_is_enforced(self):
+        with self.assertRaises(main.ConfigFieldError):
+            main.coerce_config_value("median_window", 0)
+        with self.assertRaises(main.ConfigFieldError):
+            main.coerce_config_value("min_brightness_pct", 101)
+        # A zero poll interval would turn the loop into a ddcutil spin.
+        with self.assertRaises(main.ConfigFieldError):
+            main.coerce_config_value("override_poll_interval_seconds", 0)
+
+    def test_non_finite_number_is_rejected(self):
+        with self.assertRaises(main.ConfigFieldError):
+            main.coerce_config_value("reconnect_delay_seconds", float("inf"))
+
+    def test_url_must_be_http(self):
+        self.assertEqual(
+            main.coerce_config_value("sensor_url", "http://sensor.local/events"),
+            "http://sensor.local/events",
+        )
+        with self.assertRaises(main.ConfigFieldError):
+            main.coerce_config_value("sensor_url", "file:///etc/passwd")
+        with self.assertRaises(main.ConfigFieldError):
+            main.coerce_config_value("sensor_url", "lunarsensor.local")
+
+    def test_optional_fields_accept_empty_as_none(self):
+        self.assertIsNone(main.coerce_config_value("monitor_display", ""))
+        self.assertIsNone(main.coerce_config_value("offset_state_file", None))
+
+    def test_required_field_rejects_empty(self):
+        with self.assertRaises(main.ConfigFieldError):
+            main.coerce_config_value("sensor_event_id", "  ")
+        with self.assertRaises(main.ConfigFieldError):
+            main.coerce_config_value("median_window", None)
+
+    def test_buckets_round_trip_from_triples(self):
+        buckets = main.coerce_config_value("buckets", [[0, 10, 5], [5, 60, 30]])
+        self.assertEqual(buckets, (Bucket(0.0, 10.0, 5), Bucket(5.0, 60.0, 30)))
+
+    def test_buckets_reject_inverted_range(self):
+        with self.assertRaises(main.ConfigFieldError):
+            main.coerce_config_value("buckets", [[50, 10, 5]])
+
+    def test_buckets_reject_non_ascending_brightness(self):
+        # select_bucket_index treats a lower index as darker; a descending table would
+        # make the hysteresis pick nonsense.
+        with self.assertRaises(main.ConfigFieldError):
+            main.coerce_config_value("buckets", [[0, 10, 40], [5, 60, 20]])
+
+    def test_buckets_reject_out_of_range_brightness(self):
+        with self.assertRaises(main.ConfigFieldError):
+            main.coerce_config_value("buckets", [[0, 10, 0]])
+        with self.assertRaises(main.ConfigFieldError):
+            main.coerce_config_value("buckets", [[0, 10, 120]])
+
+    def test_buckets_reject_malformed_entries(self):
+        for bad in ([], "nope", [[0, 10]], [[0, 10, 5, 7]], [["a", "b", "c"]]):
+            with self.assertRaises(main.ConfigFieldError):
+                main.coerce_config_value("buckets", bad)
+
+    def test_validate_batch_separates_good_from_bad(self):
+        accepted, errors = main.validate_config_overrides(
+            {"min_brightness_pct": 12, "median_window": 0, "bogus": 1}
+        )
+        self.assertEqual(accepted, {"min_brightness_pct": 12})
+        self.assertEqual(set(errors), {"median_window", "bogus"})
+
+
+class TestConfigFile(unittest.TestCase):
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.path = Path(self._dir.name) / "config.json"
+
+    def test_missing_file_means_defaults(self):
+        self.assertEqual(main.load_config(self.path), Config())
+
+    def test_corrupt_file_falls_back_to_defaults(self):
+        self.path.write_text("{not json")
+        self.assertEqual(main.load_config(self.path), Config())
+
+    def test_non_object_file_falls_back_to_defaults(self):
+        self.path.write_text("[1, 2, 3]")
+        self.assertEqual(main.load_config(self.path), Config())
+
+    def test_unknown_keys_are_dropped_but_the_rest_is_kept(self):
+        self.path.write_text(json.dumps({"min_brightness_pct": 12, "from_the_future": True}))
+        self.assertEqual(main.load_config(self.path).min_brightness_pct, 12)
+
+    def test_invalid_value_is_dropped_field_by_field(self):
+        self.path.write_text(json.dumps({"min_brightness_pct": 12, "median_window": -1}))
+        config = main.load_config(self.path)
+        self.assertEqual(config.min_brightness_pct, 12)
+        self.assertEqual(config.median_window, Config().median_window)
+
+    def test_buckets_are_rebuilt_as_bucket_tuples(self):
+        self.path.write_text(json.dumps({"buckets": [[0, 10, 5], [5, 60, 30]]}))
+        buckets = main.load_config(self.path).buckets
+        self.assertIsInstance(buckets[0], Bucket)
+        self.assertEqual(buckets[1].brightness_pct, 30)
+
+    def test_save_writes_only_overrides(self):
+        main.save_config(replace(Config(), min_brightness_pct=12), self.path)
+        self.assertEqual(json.loads(self.path.read_text()), {"min_brightness_pct": 12})
+
+    def test_save_load_round_trip(self):
+        config = replace(
+            Config(),
+            min_brightness_pct=12,
+            sensor_url="https://sensor.example/events",
+            monitor_display="2",
+            buckets=(Bucket(0, 10, 5), Bucket(5, 60, 30)),
+        )
+        main.save_config(config, self.path)
+        self.assertEqual(main.load_config(self.path), config)
+
+    def test_defaults_save_as_an_empty_object(self):
+        main.save_config(Config(), self.path)
+        self.assertEqual(json.loads(self.path.read_text()), {})
+
+    def test_env_var_selects_the_path(self):
+        with mock.patch.dict(os.environ, {main.CONFIG_FILE_ENV_VAR: str(self.path)}):
+            self.assertEqual(main.config_file_path(), self.path)
+
+    def test_schema_reports_default_and_current(self):
+        schema = {entry["name"]: entry for entry in main.config_schema(replace(Config(), median_window=9))}
+        self.assertEqual(schema["median_window"]["current"], 9)
+        self.assertEqual(schema["median_window"]["default"], Config().median_window)
+        self.assertEqual(schema["buckets"]["current"][0], [0.0, 10.0, 5])  # serialized as triples
+
+
+# --------------------------------------------------------------------------- #
+# Runtime re-application of settings (the apply matrix)
+# --------------------------------------------------------------------------- #
+
+class TestComponentSetConfig(unittest.TestCase):
+    def test_median_window_rebuild_keeps_the_newest_samples(self):
+        f = LuxMedianFilter(replace(Config(), median_window=5))
+        for value in (1.0, 2.0, 3.0, 4.0, 5.0):
+            f.add_reading(value)
+        f.set_config(replace(Config(), median_window=3))
+        self.assertEqual(f.sample_count, 3)
+        self.assertEqual(f.add_reading(9.0), 5.0)  # median of the newest (4,5,9)
+
+    def test_update_gate_picks_up_a_new_interval(self):
+        gate = BrightnessUpdateGate(replace(Config(), min_seconds_between_updates=10_000.0))
+        gate.mark_applied()
+        self.assertFalse(gate.enough_time_passed())
+        gate.set_config(replace(Config(), min_seconds_between_updates=0.0))
+        self.assertTrue(gate.enough_time_passed())
+
+    def test_controller_forwards_the_config_to_its_backend(self):
+        # monitor_display / powerdevil_show_osd are read on the backend, not the
+        # controller - a swap that stopped at the controller would do nothing.
+        controller = MonitorController(replace(Config(), prefer_powerdevil=False))
+        controller.set_config(replace(Config(), prefer_powerdevil=False, monitor_display="2"))
+        self.assertEqual(controller.backend._display_args(), ["--display", "2"])
+
+    def test_powerdevil_osd_toggle_keeps_shows_native_osd_consistent(self):
+        powerdevil = main.PowerDevilBackend("/org/kde/ScreenBrightness/x", Config())
+        with mock.patch.object(main.PowerDevilBackend, "detect", return_value=powerdevil):
+            controller = MonitorController(Config())
+        self.assertTrue(controller.shows_native_osd)
+
+        controller.set_config(replace(Config(), powerdevil_show_osd=False))
+        self.assertFalse(controller.shows_native_osd)
+        self.assertFalse(controller.backend._config.powerdevil_show_osd)
+
+    def test_turning_powerdevil_off_reselects_the_backend_and_reanchors(self):
+        powerdevil = main.PowerDevilBackend("/org/kde/ScreenBrightness/x", Config())
+        with mock.patch.object(main.PowerDevilBackend, "detect", return_value=powerdevil):
+            controller = MonitorController(Config())
+
+        with mock.patch.object(main.DdcutilBackend, "get_current_pct", return_value=42):
+            adopted = controller.set_config(replace(Config(), prefer_powerdevil=False))
+        self.assertEqual(adopted, 42)  # the new backend's own reading is the truth
+        self.assertIsInstance(controller.backend, main.DdcutilBackend)
+        self.assertFalse(controller.shows_native_osd)
+
+    def test_hot_field_change_does_not_reselect_the_backend(self):
+        controller = MonitorController(replace(Config(), prefer_powerdevil=False))
+        backend = controller.backend
+        self.assertIsNone(controller.set_config(replace(Config(), prefer_powerdevil=False, min_brightness_pct=9)))
+        self.assertIs(controller.backend, backend)
+
+    def test_guard_follows_a_moved_state_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "a.json"
+            second = Path(directory) / "b.json"
+            guard = ManualOverrideGuard(replace(Config(), offset_state_file=str(first)), FakeMonitor(50))
+            guard.set_offset(7)
+            guard.set_config(replace(Config(), offset_state_file=str(second)))
+            self.assertEqual(json.loads(second.read_text())["offset_pct"], 7)
+
+
+# --------------------------------------------------------------------------- #
+# Offset setter (tray-driven, as opposed to a detected manual change)
+# --------------------------------------------------------------------------- #
+
+class TestSetOffset(unittest.TestCase):
+    def _guard(self, monitor=None, **overrides) -> ManualOverrideGuard:
+        overrides.setdefault("offset_state_file", None)
+        return ManualOverrideGuard(replace(Config(), **overrides), monitor or FakeMonitor(50))
+
+    def test_clamps_to_the_sane_range(self):
+        guard = self._guard()
+        guard.set_offset(500)
+        self.assertEqual(guard.offset_pct, 99)
+        guard.set_offset(-500)
+        self.assertEqual(guard.offset_pct, -99)
+
+    def test_clears_a_running_cooldown(self):
+        # An offset set in Lunos's own UI is a request to act, not to back off.
+        guard = self._guard(manual_override_cooldown_seconds=10_000.0)
+        guard.record_override(actual_pct=60, ambient_target_pct=50)
+        self.assertTrue(guard.active())
+        guard.set_offset(5)
+        self.assertFalse(guard.active())
+        self.assertEqual(guard.offset_pct, 5)
+
+    def test_does_not_round_trip_through_the_monitor(self):
+        # record_override would recompute the offset from actual-minus-target and hand
+        # back a different number than the user picked.
+        class ExplodingMonitor:
+            def get_current_brightness_pct(self):
+                raise AssertionError("set_offset must not read the monitor")
+
+        guard = self._guard(monitor=ExplodingMonitor())
+        guard.set_offset(-12)
+        self.assertEqual(guard.offset_pct, -12)
+
+    def test_is_persisted_and_restored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "offset.json"
+            config = replace(Config(), offset_state_file=str(path))
+            ManualOverrideGuard(config, FakeMonitor(50)).set_offset(-8)
+            self.assertEqual(ManualOverrideGuard(config, FakeMonitor(50)).offset_pct, -8)
+
+    def test_clear_override_keeps_the_offset(self):
+        guard = self._guard(manual_override_cooldown_seconds=10_000.0)
+        guard.record_override(actual_pct=60, ambient_target_pct=50)
+        guard.clear_override()
+        self.assertFalse(guard.active())
+        self.assertEqual(guard.offset_pct, 10)
+
+    def test_start_override_pauses_without_recording_an_offset(self):
+        guard = self._guard()
+        guard.start_override(10_000.0)
+        self.assertTrue(guard.active())
+        self.assertEqual(guard.offset_pct, 0)
+        self.assertGreater(guard.seconds_left(), 0)
+
+
+# --------------------------------------------------------------------------- #
+# Daemon: command handling, apply matrix, snapshot
+# --------------------------------------------------------------------------- #
+
+class TestDaemonCommands(unittest.TestCase):
+    def test_test_daemons_never_write_the_users_real_config_file(self):
+        # Regression: make_daemon() once left config_path=None, so every set_config in
+        # this file persisted to ~/.config/lunos/config.json and the next daemon start
+        # picked up the fixtures (a one-bucket 70% curve, notifications off).
+        daemon = make_daemon()
+        self.assertIsNotNone(daemon._config_path)
+        self.assertNotEqual(Path(daemon._config_path), main.config_file_path())
+        daemon.dispatch("set_config", {"fields": {"min_brightness_pct": 9}})
+        daemon._drain_commands()
+        self.assertTrue(Path(daemon._config_path).exists())
+        self.assertTrue(str(daemon._config_path).startswith(tempfile.gettempdir()))
+
+    def test_snapshot_reports_live_state(self):
+        daemon = make_daemon()
+        daemon.handle_reading(20.0)
+        daemon._publish_snapshot()
+        state = daemon.snapshot()
+        self.assertEqual(state["raw_lux"], 20.0)
+        self.assertEqual(state["median_lux"], 20.0)
+        self.assertEqual(state["backend"], "ddcutil")
+        self.assertTrue(state["sensor_connected"])
+        self.assertEqual(state["protocol"], main.PROTOCOL_VERSION)
+
+    def test_commands_submitted_from_another_thread_run_on_the_loop_thread(self):
+        daemon = make_daemon()
+        loop_thread = threading.get_ident()
+        seen: list[int] = []
+        daemon.add_snapshot_listener(lambda state: seen.append(threading.get_ident()))
+
+        worker = threading.Thread(target=lambda: daemon.dispatch("set_offset", {"offset_pct": 10}))
+        worker.start()
+        worker.join()
+        self.assertEqual(daemon.override_guard.offset_pct, 0)  # not applied off-thread
+
+        daemon._drain_commands()
+        daemon._publish_snapshot()
+        self.assertEqual(daemon.override_guard.offset_pct, 10)
+        self.assertEqual(seen, [loop_thread])
+
+    def test_offset_change_applies_without_waiting_for_a_bucket_change(self):
+        monitor = FakeMonitorController(current=20)
+        daemon = make_daemon(monitor)
+        daemon.handle_reading(20.0)
+        self.assertEqual(monitor.writes, [])  # steady light, bucket unchanged
+
+        daemon.dispatch("set_offset", {"offset_pct": 10})
+        daemon._drain_commands()
+        daemon.handle_reading(20.0)
+        self.assertEqual(monitor.writes, [30])  # bucket target 20% + offset
+
+    def test_offset_is_applied_only_once(self):
+        monitor = FakeMonitorController(current=20)
+        daemon = make_daemon(monitor)
+        daemon.dispatch("set_offset", {"offset_pct": 10})
+        daemon._drain_commands()
+        daemon.handle_reading(20.0)
+        daemon.handle_reading(20.0)
+        self.assertEqual(monitor.writes, [30])
+
+    def test_pause_blocks_adjustment_and_resume_reapplies(self):
+        monitor = FakeMonitorController(current=20)
+        daemon = make_daemon(monitor)
+        daemon.dispatch("pause", {})
+        daemon._drain_commands()
+        daemon.handle_reading(500.0)  # a bucket change that must not be applied
+        self.assertEqual(monitor.writes, [])
+
+        daemon.dispatch("resume", {})
+        daemon._drain_commands()
+        daemon.handle_reading(500.0)
+        self.assertEqual(monitor.writes, [80])
+
+    def test_pause_with_seconds_uses_the_override_cooldown(self):
+        daemon = make_daemon()
+        daemon.dispatch("pause", {"seconds": 600})
+        daemon._drain_commands()
+        self.assertTrue(daemon.override_guard.active())
+        self.assertFalse(daemon._paused)
+
+    def test_restart_stops_the_loop(self):
+        daemon = make_daemon()
+        daemon.dispatch("restart", {})
+        daemon._drain_commands()
+        self.assertTrue(daemon._stop_requested)
+
+    def test_unknown_command_is_reported_not_ignored(self):
+        reply = make_daemon().dispatch("drop_tables", {})
+        self.assertFalse(reply["ok"])
+        self.assertIn("unknown command", reply["error"])
+
+    def test_set_offset_rejects_bad_payloads(self):
+        daemon = make_daemon()
+        for payload in ({}, {"offset_pct": "10"}, {"offset_pct": True}, {"offset_pct": 500}):
+            self.assertFalse(daemon.dispatch("set_offset", payload)["ok"], payload)
+
+    def test_set_config_reports_invalid_fields_and_applies_nothing(self):
+        daemon = make_daemon()
+        reply = daemon.dispatch("set_config", {"fields": {"min_brightness_pct": 999}})
+        self.assertFalse(reply["ok"])
+        self.assertIn("min_brightness_pct", reply["errors"])
+        daemon._drain_commands()
+        self.assertEqual(daemon.config.min_brightness_pct, Config().min_brightness_pct)
+
+    def test_set_config_classifies_fields_by_how_they_apply(self):
+        reply = make_daemon().dispatch("set_config", {"fields": {
+            "min_brightness_pct": 9,
+            "sensor_url": "http://other.local/events",
+            "default_bucket_index": 2,
+        }})
+        self.assertEqual(reply["applied"], ["min_brightness_pct"])
+        self.assertEqual(reply["reconnecting"], ["sensor_url"])
+        self.assertEqual(reply["restart_required"], ["default_bucket_index"])
+
+    def test_set_config_persists_the_overrides(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            daemon = make_daemon()
+            daemon._config_path = path
+            daemon.dispatch("set_config", {"fields": {"min_brightness_pct": 9}})
+            daemon._drain_commands()
+            self.assertEqual(daemon.config.min_brightness_pct, 9)
+            self.assertEqual(json.loads(path.read_text())["min_brightness_pct"], 9)
+
+    def test_reload_config_rereads_a_hand_edited_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps({"min_brightness_pct": 11}))
+            daemon = make_daemon()
+            daemon._config_path = path
+            daemon.dispatch("reload_config", {})
+            daemon._drain_commands()
+            self.assertEqual(daemon.config.min_brightness_pct, 11)
+
+    def test_sensor_field_change_requests_a_reconnect(self):
+        daemon = make_daemon()
+        daemon.apply_config(replace(daemon.config, sensor_url="http://other.local/events"))
+        self.assertTrue(daemon._reconnect_requested)
+
+    def test_hot_field_change_does_not_request_a_reconnect(self):
+        daemon = make_daemon()
+        daemon.apply_config(replace(daemon.config, min_brightness_pct=9))
+        self.assertFalse(daemon._reconnect_requested)
+
+    def test_new_bucket_table_reanchors_the_current_index(self):
+        daemon = make_daemon(FakeMonitorController(current=80))
+        self.assertEqual(daemon.current_bucket_index, 5)  # 80% -> bucket 6 of the defaults
+        daemon.apply_config(replace(daemon.config, buckets=(Bucket(0, 50, 30), Bucket(20, 1000, 90))))
+        # The old index 5 doesn't exist in the new two-rung table; 80% is nearest 90%.
+        self.assertEqual(daemon.current_bucket_index, 1)
+
+    def test_hot_field_is_visible_on_the_next_reading(self):
+        monitor = FakeMonitorController(current=20)
+        daemon = make_daemon(monitor)
+        daemon.dispatch("set_config", {"fields": {"buckets": [[0, 1000, 70]]}})
+        daemon._drain_commands()
+        daemon.handle_reading(20.0)
+        self.assertEqual(monitor.writes, [70])
+
+    def test_min_brightness_floor_survives_a_large_negative_offset(self):
+        monitor = FakeMonitorController(current=20)
+        daemon = make_daemon(monitor, min_brightness_pct=5)
+        daemon.dispatch("set_offset", {"offset_pct": -99})
+        daemon._drain_commands()
+        daemon.handle_reading(20.0)
+        self.assertEqual(monitor.writes, [5])
+
+    def test_daemon_starts_when_default_bucket_index_exceeds_the_table(self):
+        # A shrunken bucket table would otherwise index out of range at startup.
+        daemon = make_daemon(
+            FakeMonitorController(current=None),
+            buckets=(Bucket(0, 50, 30), Bucket(20, 1000, 90)),
+            default_bucket_index=5,
+        )
+        self.assertEqual(daemon.current_bucket_index, 1)
+
+    def test_dispatch_get_schema_reflects_the_live_config(self):
+        daemon = make_daemon()
+        daemon.dispatch("set_config", {"fields": {"median_window": 7}})
+        daemon._drain_commands()
+        schema = {entry["name"]: entry for entry in daemon.dispatch("get_schema", {})["schema"]}
+        self.assertEqual(schema["median_window"]["current"], 7)
+
+    def test_a_failing_listener_does_not_break_the_loop(self):
+        daemon = make_daemon()
+
+        def boom(state):
+            raise RuntimeError("subscriber exploded")
+
+        daemon.add_snapshot_listener(boom)
+        daemon._publish_snapshot()  # must not raise
+
+    def test_a_failing_command_does_not_break_the_loop(self):
+        daemon = make_daemon()
+        before = daemon.config
+        daemon.submit("set_config", {"fields": {"not_a_setting": 1}})  # bypasses dispatch's validation
+        daemon._drain_commands()  # must not raise
+        self.assertIs(daemon.config, before)
 
 
 if __name__ == "__main__":

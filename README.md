@@ -31,6 +31,8 @@ and own yourself.
    for a cooldown period and resumes from that new value afterwards, instead of immediately
    overriding you.
 8. Runs as a systemd user service and auto-restarts on failure.
+9. Optionally exposes all of this through a [system tray app](#system-tray-app) — settings and a
+   live brightness offset without editing Python.
 
 ## Requirements
 
@@ -48,7 +50,8 @@ and own yourself.
 ## Installation
 
 ```sh
-./install.sh
+./install.sh                # daemon only
+./install.sh --with-tray    # daemon + system tray app (needs python3-pyside6)
 ```
 
 This creates a Python venv in `venv/`, installs the dependencies from `requirements.txt`, and
@@ -57,6 +60,10 @@ registers + starts a systemd user service (`lunos.service`) that restarts automa
 Re-running it is safe and idempotent: it reuses the existing venv, rewrites the unit file, and
 restarts the service — so a re-run also applies any changes you've made to `main.py`.
 
+`--with-tray` additionally installs `lunos-tray.service` and a `.desktop` entry (see
+[System tray app](#system-tray-app)). It checks for PySide6 on the *system* interpreter and tells
+you to `sudo dnf install python3-pyside6` rather than pulling a ~150 MB wheel into the venv.
+
 ## Usage
 
 ```sh
@@ -64,24 +71,95 @@ systemctl --user status lunos.service      # check it's running
 journalctl --user -u lunos.service -f      # watch live logs
 systemctl --user stop lunos.service        # stop it
 systemctl --user disable lunos.service     # stop it from starting on login
+
+systemctl --user status lunos-tray.service # same for the tray app, if installed
 ```
 
 ## Tests
 
-The core logic (bucket curve, median filter, manual-override guard, ramping) is covered by a
-`unittest` suite in `tests/test_main.py`. It uses fakes for the monitor and sensor, so no
-hardware, `busctl`, or `ddcutil` is needed. Run it from the repo root with the project venv (the
-tests import `main`, which pulls in `requests`/`sseclient`):
+The core logic (bucket curve, median filter, manual-override guard, ramping, the config overlay,
+the apply matrix) and the control socket are covered by a `unittest` suite in `tests/`. It uses
+fakes for the monitor and sensor, so no hardware, `busctl`, or `ddcutil` is needed. Run it from the
+repo root with the project venv (the tests import `main`, which pulls in `requests`/`sseclient`):
 
 ```sh
-venv/bin/python3 -m unittest tests.test_main -v     # verbose
-venv/bin/python3 -m unittest tests.test_main        # quiet
+venv/bin/python3 -m unittest discover -s tests -t .      # everything
+venv/bin/python3 -m unittest discover -s tests -t . -v   # verbose
+venv/bin/python3 -m unittest tests.test_main             # just the daemon logic
 ```
+
+`tests/test_tray.py` is skipped unless PySide6 is installed; the rest of the tray (SNI
+registration, DBusMenu rendering, the login race) is covered by the manual checklist in
+[`docs/features/system-tray-app.md`](docs/features/system-tray-app.md), which no unit test can
+stand in for.
+
+## System tray app
+
+`tray.py` is an optional GUI client (PySide6/Qt 6) that puts every setting behind a window and
+exposes the manual brightness offset as a live slider. It is a **separate process** and a pure
+client: quitting or crashing it does not stop auto-brightness, and the daemon runs perfectly well
+without it ever being installed.
+
+```sh
+sudo dnf install python3-pyside6   # Fedora; other distros: pip install PySide6 into a separate venv
+./install.sh --with-tray
+```
+
+- **Tray menu** — live state (lux, brightness, bucket), active backend, a brightness-offset radio
+  submenu, a pause toggle, `Settings…`, `Restart daemon`, and `Quit tray app` (which stops only the
+  GUI — the label says so).
+- **Settings window** — one tab per section, generated from the daemon's own schema: sensor, the
+  bucket curve (table + live preview), behaviour, backend, notifications. Left-clicking the tray
+  icon opens it.
+- **Latency** — commands are applied on the daemon's loop thread, so a change lands within about
+  one lux reading (~1 s), or after the current connection attempt while the sensor is down.
+- **GNOME** has no tray of its own: install and enable `gnome-shell-extension-appindicator`,
+  otherwise the app says so instead of starting invisibly. Fedora KDE works out of the box.
+
+The two halves talk over a per-user Unix socket at `$XDG_RUNTIME_DIR/lunos/control.sock`
+(`~/.cache/lunos/control.sock` without a runtime dir), speaking one JSON object per line. Access
+control is the socket's file permissions and nothing else — the same trust boundary as the session
+bus. It is drivable by hand:
+
+```sh
+socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/lunos/control.sock
+{"cmd": "get_state"}
+```
+
+| Command | Payload | Does |
+|---|---|---|
+| `get_state` | — | live snapshot: lux, bucket, brightness, offset, backend, sensor/override state |
+| `get_schema` | — | every setting with its type, range, default and current value |
+| `set_config` | `{"fields": {...}}` | validates, applies, and persists to `config.json` |
+| `set_offset` | `{"offset_pct": int}` | sets the standing offset and ends any override cooldown |
+| `pause` / `resume` | optional `seconds` | pause auto-adjustment (indefinitely, or for a while) |
+| `reload_config` | — | re-read `config.json` after hand-editing it |
+| `restart` | — | daemon exits cleanly; `Restart=always` brings it back |
+| `subscribe` | — | connection switches to push mode: one state object per loop iteration |
+
+Every reply carries `"ok"` and `"protocol"`, so mismatched halves fail loudly instead of
+misparsing.
 
 ## Configuration
 
-There's no external config file — every setting lives in the `Config` dataclass at the top of
-`main.py`. Re-run `install.sh` (or just restart the service) after changing it. Notable fields:
+The `Config` dataclass at the top of `main.py` is the **schema, the defaults and the
+documentation**. `~/.config/lunos/config.json` holds **only the settings you have changed** — an
+absent file means the defaults, exactly as before.
+
+The daemon is the only writer of that file. Change settings through the tray app (or by sending
+`set_config` over the control socket) and it validates, applies and saves them; edit the file by
+hand and the change takes effect on the next `reload_config` or service restart. Editing the
+dataclass defaults still works too, and still needs a restart.
+
+Most settings apply live. Three groups differ:
+
+- **Sensor settings** (`sensor_url`, `sensor_event_id`, the two timeouts) drop and re-open the SSE
+  stream, because a running stream captured the old values.
+- **`default_bucket_index`** only matters at startup, so it is saved but takes effect at the next
+  start. The settings window labels it as such.
+- Everything else is hot from the next lux reading onward.
+
+Notable fields:
 
 | Field | Purpose |
 |---|---|

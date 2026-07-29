@@ -12,13 +12,16 @@ from __future__ import annotations
 import json
 import math
 import os
+import queue
 import re
 import subprocess
+import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, fields as dataclass_fields, replace
 from pathlib import Path
-from typing import NamedTuple, Protocol
+from typing import Any, Callable, NamedTuple, Protocol
+from urllib.parse import urlparse
 
 
 import requests
@@ -119,6 +122,417 @@ class Config:
 
 
 # --------------------------------------------------------------------------- #
+# Config file overlay
+#
+# The dataclass above stays the schema, the defaults and the documentation; the
+# file below holds *only explicit overrides*. An absent or unreadable file
+# therefore means exactly today's behavior, which is what keeps an existing
+# install working unchanged after an upgrade.
+#
+# The daemon is the only writer (the tray app sends set_config over the control
+# socket instead of writing the file itself), so there is one writer, no locking
+# and no merge logic.
+# --------------------------------------------------------------------------- #
+
+DEFAULT_CONFIG_FILE = "~/.config/lunos/config.json"
+CONFIG_FILE_ENV_VAR = "LUNOS_CONFIG_FILE"  # mostly for tests and for running two instances side by side
+
+
+class FieldSpec(NamedTuple):
+    """
+    Everything that is known about a Config field beyond its default: how to
+    validate it, what changing it costs at runtime, and how a GUI should render
+    it. One hand-maintained table feeds all three (validation, the apply matrix,
+    and the `get_schema` reply the tray builds its settings window from), so a
+    new setting is a single entry here rather than three places to forget.
+    """
+
+    kind: str                     # "bool" | "int" | "float" | "str" | "url" | "path" | "buckets"
+    section: str                  # which settings tab a GUI should put it on
+    label: str
+    apply: str = "hot"            # "hot" (next loop iteration) | "reconnect" (drops the SSE stream) | "restart"
+    minimum: float | None = None
+    maximum: float | None = None
+    step: float | None = None
+    unit: str | None = None
+    optional: bool = False        # None is a meaningful value (e.g. "no display filter")
+    help: str = ""
+
+
+FIELD_SPECS: dict[str, FieldSpec] = {
+    "sensor_url": FieldSpec(
+        "url", "sensor", "Sensor URL", apply="reconnect",
+        help="The sensor's server-sent-events endpoint. Use its .local name unless mDNS is "
+             "unreliable on your network, in which case use the IP address. Changing this "
+             "re-opens the stream immediately.",
+    ),
+    "sensor_event_id": FieldSpec(
+        "str", "sensor", "Sensor event id", apply="reconnect",
+        help="Which channel of the stream carries lux values. The sensor also publishes other "
+             "channels (raw infrared, full spectrum) that must be ignored. This id comes from your "
+             "device's firmware and can differ from lunar.fyi's documentation example - if Lunos "
+             "connects but never reads a value, this is almost always why.",
+    ),
+    "connection_timeout_seconds": FieldSpec(
+        "float", "sensor", "Connection timeout", apply="reconnect",
+        minimum=1.0, maximum=600.0, step=1.0, unit="s",
+        help="How long to wait for the sensor to answer before giving up and retrying. Raise it if "
+             "a slow or busy Wi-Fi link causes needless reconnects.",
+    ),
+    "stale_reading_timeout_seconds": FieldSpec(
+        "float", "sensor", "Stale-reading timeout", apply="reconnect",
+        minimum=5.0, maximum=3600.0, step=5.0, unit="s",
+        help="A sensor saturated by direct light can stop publishing readings while its connection "
+             "stays open. After this long without a valid value, Lunos reconnects instead of waiting "
+             "forever. Too low and a genuinely dark, quiet room triggers pointless reconnects.",
+    ),
+    "reconnect_delay_seconds": FieldSpec(
+        "float", "sensor", "Reconnect delay",
+        minimum=0.5, maximum=300.0, step=0.5, unit="s",
+        help="Pause before retrying after the connection drops - which is also how long a sensor "
+             "that is switched off keeps this many log lines coming. Commands from this app can be "
+             "delayed by up to this long while the sensor is down.",
+    ),
+    "buckets": FieldSpec(
+        "buckets", "curve", "Lux to brightness curve",
+        help="Each row maps a lux range to one brightness level. Neighbouring rows should overlap: "
+             "while a reading stays inside the current row's range the brightness does not change, "
+             "and that is the entire flicker protection. Rows must climb in brightness from top to "
+             "bottom. Tune the lux ranges to your room and the percentages to your monitor.",
+    ),
+    "default_bucket_index": FieldSpec(
+        "int", "curve", "Fallback bucket", apply="restart",
+        minimum=0, maximum=99, step=1,
+        help="Which row to assume at startup when the monitor's current brightness cannot be read "
+             "at all (no DDC/CI answer). Normally unused: Lunos anchors to the brightness the "
+             "monitor actually reports. Counted from 0.",
+    ),
+    "min_brightness_pct": FieldSpec(
+        "int", "behaviour", "Minimum brightness",
+        minimum=0, maximum=100, step=1, unit="%",
+        help="Brightness never goes below this, even after the offset below is subtracted. It exists "
+             "so a large negative offset on a dark row cannot drive the panel to 0% and leave you "
+             "with a black screen.",
+    ),
+    "min_seconds_between_updates": FieldSpec(
+        "float", "behaviour", "Minimum gap between updates",
+        minimum=0.0, maximum=600.0, step=0.5, unit="s",
+        help="Rate limit between two applied brightness changes. Light that keeps crossing a row "
+             "boundary (a cloudy day, a flickering lamp) otherwise turns into a stream of writes to "
+             "the monitor.",
+    ),
+    "median_window": FieldSpec(
+        "int", "behaviour", "Median filter window",
+        minimum=1, maximum=99, step=1, unit="samples",
+        help="How many recent readings the median is taken over, which is what stops a single spike "
+             "(a phone torch, a passing headlight) from moving the brightness. Higher is steadier "
+             "but slower to react; 1 disables smoothing entirely.",
+    ),
+    "transition_step_granularity_pct": FieldSpec(
+        "int", "behaviour", "Ramp step size",
+        minimum=1, maximum=100, step=1, unit="%",
+        help="Target size of one step when easing into a big brightness change instead of jumping. "
+             "Smaller looks smoother but costs one slow monitor write per step. Unused on the "
+             "PowerDevil backend, which smooths changes itself.",
+    ),
+    "max_transition_steps": FieldSpec(
+        "int", "behaviour", "Maximum ramp steps",
+        minimum=1, maximum=50, step=1,
+        help="Hard cap on steps per change, so even a jump from 5% to 100% stays quick rather than "
+             "becoming a slideshow. A normal one-row change is a single step anyway. Unused on the "
+             "PowerDevil backend.",
+    ),
+    "transition_step_delay_seconds": FieldSpec(
+        "float", "behaviour", "Delay between ramp steps",
+        minimum=0.0, maximum=5.0, step=0.05, unit="s",
+        help="Extra pause between individual ramp steps. Monitors that garble rapid DDC/CI writes "
+             "settle down with a little more here. Unused on the PowerDevil backend.",
+    ),
+    "override_poll_interval_seconds": FieldSpec(
+        "float", "behaviour", "Manual-change poll interval",
+        minimum=0.5, maximum=600.0, step=0.5, unit="s",
+        help="How often Lunos reads the monitor's real brightness to notice changes it did not make "
+             "itself - the monitor's own buttons, or the keyboard's brightness keys. Each poll is a "
+             "real read from the display, so very short intervals mean constant traffic.",
+    ),
+    "manual_override_tolerance_pct": FieldSpec(
+        "int", "behaviour", "Manual-change tolerance",
+        minimum=0, maximum=100, step=1, unit="%",
+        help="How far the monitor may differ from the last applied value before it counts as your "
+             "doing. A few percent of slack is needed because monitors round the value they report; "
+             "set it to 0 and that rounding alone looks like a manual change.",
+    ),
+    "manual_override_cooldown_seconds": FieldSpec(
+        "float", "behaviour", "Manual-change cooldown",
+        minimum=0.0, maximum=86400.0, step=30.0, unit="s",
+        help="After a manual change is detected, automatic adjustment stays out of the way for this "
+             "long, then resumes from your new value. The difference is also remembered as the "
+             "offset above. Setting the offset here in Lunos ends the cooldown at once - asking "
+             "Lunos for a brightness is asking it to act, not to back off.",
+    ),
+    "offset_state_file": FieldSpec(
+        "path", "behaviour", "Offset state file", optional=True,
+        help="File the standing offset is written to so it survives restarts and reboots. The pause "
+             "after a manual change is deliberately not saved - that is a reaction to a moment, not "
+             "a lasting preference. Leave empty to have the offset reset to 0 on every start.",
+    ),
+    "prefer_powerdevil": FieldSpec(
+        "bool", "backend", "Prefer KDE PowerDevil",
+        help="On KDE Plasma, let PowerDevil set the brightness instead of Lunos driving the monitor "
+             "directly. Recommended there: Plasma's own slider and OSD stay in step, and two "
+             "programs never fight over the same monitor. Falls back to ddcutil automatically "
+             "wherever PowerDevil is absent, so leaving this on costs nothing on other desktops.",
+    ),
+    "powerdevil_display_label_contains": FieldSpec(
+        "str", "backend", "PowerDevil display filter", optional=True,
+        help="Part of a display's name, used to choose between several external monitors under "
+             "PowerDevil - for example \"U2720\". Matching ignores case. Leave empty to use the "
+             "first display that is not the built-in laptop panel.",
+    ),
+    "powerdevil_show_osd": FieldSpec(
+        "bool", "backend", "Show Plasma's brightness OSD",
+        help="Show Plasma's usual brightness popup for changes Lunos makes. It is also what makes "
+             "the brightness applet's slider refresh, so turning it off can leave that slider "
+             "showing a stale value. While it is on, Lunos skips its own notification rather than "
+             "announcing the same change twice.",
+    ),
+    "powerdevil_redetect_interval_seconds": FieldSpec(
+        "float", "backend", "PowerDevil re-detection interval",
+        minimum=1.0, maximum=3600.0, step=5.0, unit="s",
+        help="At login Lunos often starts before PowerDevil is ready and falls back to ddcutil. This "
+             "is how often it re-checks and switches over once PowerDevil appears. Only matters "
+             "while the fallback is in use; the checking stops for good after the switch.",
+    ),
+    "monitor_display": FieldSpec(
+        "str", "backend", "ddcutil display", optional=True,
+        help="Which monitor ddcutil should address when several are connected - run 'ddcutil detect' "
+             "to see the numbers. Leave empty for a single monitor. Ignored while the PowerDevil "
+             "backend is in use, which picks the display by name instead.",
+    ),
+    "notifications_enabled": FieldSpec(
+        "bool", "notifications", "Desktop notifications",
+        help="Pop up a desktop notification when the brightness changes, when a manual change is "
+             "detected, and when setting the brightness fails. Needs notify-send. Notifications are "
+             "skipped anyway while Plasma shows its own brightness popup.",
+    ),
+    "notification_timeout_ms": FieldSpec(
+        "int", "notifications", "Notification timeout",
+        minimum=0, maximum=600000, step=500, unit="ms",
+        help="How long a notification stays on screen. Some notification daemons enforce their own "
+             "limits and ignore this.",
+    ),
+}
+
+
+class ConfigFieldError(ValueError):
+    """A single rejected field value, carrying a message meant for a UI."""
+
+
+def config_file_path(path: str | os.PathLike[str] | None = None) -> Path:
+    """The config file to read/write: explicit argument, env override, or the XDG default."""
+    if path is not None:
+        return Path(path).expanduser()
+    return Path(os.environ.get(CONFIG_FILE_ENV_VAR) or DEFAULT_CONFIG_FILE).expanduser()
+
+
+def _coerce_number(name: str, value: Any, spec: FieldSpec) -> int | float:
+    if isinstance(value, bool):  # bool is an int subclass; "true" is not a poll interval
+        raise ConfigFieldError(f"{name}: expected a number, got a boolean")
+    if not isinstance(value, (int, float)):
+        raise ConfigFieldError(f"{name}: expected a number, got {type(value).__name__}")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ConfigFieldError(f"{name}: must be a finite number")
+    number = int(value) if spec.kind == "int" else float(value)
+    if spec.kind == "int" and value != number:
+        raise ConfigFieldError(f"{name}: expected a whole number, got {value}")
+    if spec.minimum is not None and number < spec.minimum:
+        raise ConfigFieldError(f"{name}: must be at least {spec.minimum:g}")
+    if spec.maximum is not None and number > spec.maximum:
+        raise ConfigFieldError(f"{name}: must be at most {spec.maximum:g}")
+    return number
+
+
+def _coerce_buckets(value: Any) -> tuple[Bucket, ...]:
+    """Rebuilds the bucket table from a list of [min_lux, max_lux, brightness_pct] triples."""
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ConfigFieldError("buckets: expected a non-empty list of [min_lux, max_lux, brightness_pct] triples")
+
+    buckets: list[Bucket] = []
+    for position, entry in enumerate(value, start=1):
+        if not isinstance(entry, (list, tuple)) or len(entry) != 3:
+            raise ConfigFieldError(f"buckets: entry {position} must be [min_lux, max_lux, brightness_pct]")
+        min_lux, max_lux, brightness_pct = entry
+        for number in (min_lux, max_lux, brightness_pct):
+            if isinstance(number, bool) or not isinstance(number, (int, float)) or not math.isfinite(number):
+                raise ConfigFieldError(f"buckets: entry {position} contains a non-numeric value")
+        if min_lux < 0 or max_lux < 0:
+            raise ConfigFieldError(f"buckets: entry {position} has a negative lux bound")
+        if min_lux >= max_lux:
+            raise ConfigFieldError(f"buckets: entry {position} needs min_lux < max_lux")
+        if not 1 <= brightness_pct <= 100:
+            raise ConfigFieldError(f"buckets: entry {position} needs a brightness between 1 and 100")
+        buckets.append(Bucket(float(min_lux), float(max_lux), int(brightness_pct)))
+
+    # select_bucket_index() walks the table by index and treats a lower index as "darker",
+    # so a table that isn't ascending in brightness would make the hysteresis pick nonsense.
+    for previous, current in zip(buckets, buckets[1:]):
+        if current.brightness_pct <= previous.brightness_pct:
+            raise ConfigFieldError("buckets: brightness percentages must increase from one bucket to the next")
+    return tuple(buckets)
+
+
+def coerce_config_value(name: str, value: Any) -> Any:
+    """
+    Validates one incoming setting against FIELD_SPECS and returns the value to
+    store on Config. Raises ConfigFieldError with a message meant for a UI.
+
+    This is the single validation path for both the config file and the control
+    socket: it never setattr's an unknown name, never evaluates a value, and
+    range-checks everything before it can reach the loop or the monitor.
+    """
+    spec = FIELD_SPECS.get(name)
+    if spec is None:
+        raise ConfigFieldError(f"{name}: unknown setting")
+
+    if value is None:
+        if not spec.optional:
+            raise ConfigFieldError(f"{name}: cannot be empty")
+        return None
+
+    if spec.kind == "bool":
+        if not isinstance(value, bool):
+            raise ConfigFieldError(f"{name}: expected true or false")
+        return value
+
+    if spec.kind in ("int", "float"):
+        return _coerce_number(name, value, spec)
+
+    if spec.kind == "buckets":
+        return _coerce_buckets(value)
+
+    if not isinstance(value, str):
+        raise ConfigFieldError(f"{name}: expected a string")
+    text = value.strip()
+    if not text:
+        # An emptied text box means "unset" for an optional field, and is a mistake otherwise.
+        if spec.optional:
+            return None
+        raise ConfigFieldError(f"{name}: cannot be empty")
+
+    if spec.kind == "url":
+        parsed = urlparse(text)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ConfigFieldError(f"{name}: must be an http:// or https:// URL")
+    return text
+
+
+def validate_config_overrides(raw: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
+    """Validates a whole batch of settings, returning (accepted values, per-field errors)."""
+    accepted: dict[str, Any] = {}
+    errors: dict[str, str] = {}
+    for name, value in raw.items():
+        try:
+            accepted[name] = coerce_config_value(name, value)
+        except ConfigFieldError as error:
+            errors[name] = str(error)
+    return accepted, errors
+
+
+def _serialize_config_value(name: str, value: Any) -> Any:
+    if name == "buckets":
+        return [[bucket.min_lux, bucket.max_lux, bucket.brightness_pct] for bucket in value]
+    return value
+
+
+def config_overrides(config: Config) -> dict[str, Any]:
+    """The JSON-serializable diff between a config and the dataclass defaults."""
+    defaults = Config()
+    return {
+        field.name: _serialize_config_value(field.name, getattr(config, field.name))
+        for field in dataclass_fields(Config)
+        if getattr(config, field.name) != getattr(defaults, field.name)
+    }
+
+
+def load_config(path: str | os.PathLike[str] | None = None) -> Config:
+    """
+    Builds a Config from the defaults plus whatever the config file overrides.
+
+    Never raises: a missing, unreadable, corrupt or half-outdated file falls back
+    to the defaults for whatever it could not use, because failing to start is a
+    far worse outcome than ignoring a bad setting. Unknown keys are dropped with
+    a log line rather than migrated - a downgrade then doesn't silently wipe them
+    from a file it can still read.
+    """
+    file_path = config_file_path(path)
+    try:
+        raw = json.loads(file_path.read_text())
+    except FileNotFoundError:
+        return Config()
+    except (OSError, json.JSONDecodeError) as error:
+        log(f"Ignoring config file {file_path}: {error}")
+        return Config()
+
+    if not isinstance(raw, dict):
+        log(f"Ignoring config file {file_path}: expected a JSON object")
+        return Config()
+
+    known = {name: value for name, value in raw.items() if name in FIELD_SPECS}
+    for name in raw.keys() - known.keys():
+        log(f"Ignoring unknown setting in {file_path}: {name}")
+
+    accepted, errors = validate_config_overrides(known)
+    for message in errors.values():
+        log(f"Ignoring invalid setting in {file_path}: {message}")
+    if accepted:
+        log(f"Loaded {len(accepted)} setting(s) from {file_path}")
+    return replace(Config(), **accepted)
+
+
+def save_config(config: Config, path: str | os.PathLike[str] | None = None) -> None:
+    """
+    Persists the overrides (not the defaults) with the same write-then-rename
+    dance _save_offset() uses, so a crash mid-write cannot leave a truncated
+    file that the next start would have to ignore.
+    """
+    file_path = config_file_path(path)
+    try:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = file_path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(config_overrides(config), indent=2, sort_keys=True) + "\n")
+        os.replace(tmp_path, file_path)
+    except OSError as error:
+        log(f"Could not save config to {file_path}: {error}")
+
+
+def config_schema(config: Config) -> list[dict[str, Any]]:
+    """
+    The per-field description a GUI builds itself from: spec, default and current
+    value. Handing this over the wire is what lets the tray app import nothing
+    from the daemon and still stay in sync with new settings.
+    """
+    defaults = Config()
+    schema = []
+    for name, spec in FIELD_SPECS.items():
+        schema.append({
+            "name": name,
+            "kind": spec.kind,
+            "section": spec.section,
+            "label": spec.label,
+            "apply": spec.apply,
+            "min": spec.minimum,
+            "max": spec.maximum,
+            "step": spec.step,
+            "unit": spec.unit,
+            "optional": spec.optional,
+            "help": spec.help,
+            "default": _serialize_config_value(name, getattr(defaults, name)),
+            "current": _serialize_config_value(name, getattr(config, name)),
+        })
+    return schema
+
+
+# --------------------------------------------------------------------------- #
 # Bucketed lux -> brightness curve (modeled on Windows' bucketed ALR curve)
 # --------------------------------------------------------------------------- #
 
@@ -171,6 +585,7 @@ class BrightnessBackend(Protocol):
 
     def get_current_pct(self) -> int | None: ...
     def set_pct(self, pct: int) -> None: ...
+    def set_config(self, config: Config) -> None: ...
 
 
 class DdcutilBackend:
@@ -181,6 +596,11 @@ class DdcutilBackend:
     VCP_BRIGHTNESS_CODE = "10"
 
     def __init__(self, config: Config):
+        self._config = config
+
+    def set_config(self, config: Config) -> None:
+        # monitor_display is read here, not on MonitorController - a config swap that
+        # stopped at the controller would make that setting silently do nothing.
         self._config = config
 
     def _display_args(self) -> list[str]:
@@ -269,6 +689,12 @@ class PowerDevilBackend:
         self._config = config
         self._cached_max_brightness: int | None = None
 
+    def set_config(self, config: Config) -> None:
+        # powerdevil_show_osd is read here (in set_pct), so the swap has to reach the backend.
+        # The cached MaxBrightness stays valid: a changed display filter re-selects the whole
+        # backend instead of coming through here.
+        self._config = config
+
     def _display_property(self, prop: str):
         return _busctl_get_property(
             POWERDEVIL_SERVICE, self._display_path, POWERDEVIL_DISPLAY_INTERFACE, prop
@@ -339,10 +765,22 @@ class MonitorController:
 
     def __init__(self, config: Config):
         self._config = config
-        self.backend: BrightnessBackend | None = (
-            PowerDevilBackend.detect(config) if config.prefer_powerdevil else None
-        )
-        if self.backend is not None:
+        self.backend: BrightnessBackend | None = None
+        self._select_backend()
+
+        # Whether Lunos has itself applied a brightness change yet. Until it has, the value it
+        # "tracks" is only the monitor's power-on reading it happened to observe at startup -
+        # not something it authored, and on Plasma not authoritative (PowerDevil overwrites it
+        # with its own remembered brightness at login). This decides, on PowerDevil adoption,
+        # whether to push our value onto PowerDevil (we authored it) or adopt PowerDevil's.
+        self._applied_write = False
+
+    def _select_backend(self) -> None:
+        """(Re-)picks the backend for the current config and derives the flags that key off it."""
+        config = self._config
+        backend = PowerDevilBackend.detect(config) if config.prefer_powerdevil else None
+        if backend is not None:
+            self.backend = backend
             log("Brightness backend: KDE PowerDevil (org.kde.ScreenBrightness)")
         else:
             self.backend = DdcutilBackend(config)
@@ -358,12 +796,44 @@ class MonitorController:
         self._powerdevil_pending = config.prefer_powerdevil and not isinstance(self.backend, PowerDevilBackend)
         self._next_powerdevil_redetect_monotonic = time.monotonic() + config.powerdevil_redetect_interval_seconds
 
-        # Whether Lunos has itself applied a brightness change yet. Until it has, the value it
-        # "tracks" is only the monitor's power-on reading it happened to observe at startup -
-        # not something it authored, and on Plasma not authoritative (PowerDevil overwrites it
-        # with its own remembered brightness at login). This decides, on PowerDevil adoption,
-        # whether to push our value onto PowerDevil (we authored it) or adopt PowerDevil's.
+    @property
+    def backend_name(self) -> str:
+        return "powerdevil" if isinstance(self.backend, PowerDevilBackend) else "ddcutil"
+
+    @property
+    def powerdevil_pending(self) -> bool:
+        return self._powerdevil_pending
+
+    def set_config(self, config: Config) -> int | None:
+        """
+        Swaps in a new config at runtime. Returns the brightness the caller should
+        re-anchor to when the backend was re-selected (the new backend's own reported
+        value), or None when nothing needs re-anchoring.
+
+        Changing prefer_powerdevil or the display filter re-runs backend selection, which
+        also resets _applied_write: nothing has been written through the new backend yet,
+        so its reported brightness is the truth - the same reasoning maybe_adopt_powerdevil
+        uses when it adopts PowerDevil's value instead of forcing ours onto it.
+        """
+        previous = self._config
+        self._config = config
+        reselect = (
+            config.prefer_powerdevil != previous.prefer_powerdevil
+            or config.powerdevil_display_label_contains != previous.powerdevil_display_label_contains
+        )
+        if not reselect:
+            self.backend.set_config(config)
+            self.shows_native_osd = isinstance(self.backend, PowerDevilBackend) and config.powerdevil_show_osd
+            # A longer/shorter re-detect interval should take effect now, not after the old one elapses.
+            self._next_powerdevil_redetect_monotonic = min(
+                self._next_powerdevil_redetect_monotonic,
+                time.monotonic() + config.powerdevil_redetect_interval_seconds,
+            )
+            return None
+
+        self._select_backend()
         self._applied_write = False
+        return self.backend.get_current_pct()
 
     def maybe_adopt_powerdevil(self, current_pct: int, force: bool = False) -> int | None:
         """
@@ -463,6 +933,14 @@ class LuxMedianFilter:
     def __init__(self, config: Config):
         self._raw_history: deque[float] = deque(maxlen=config.median_window)
 
+    def set_config(self, config: Config) -> None:
+        """Resizes the window in place. deque(iterable, maxlen=n) keeps the *newest* n
+        samples, so shrinking the window doesn't throw away the recent history and
+        make the filter behave as if the daemon had just started."""
+        if config.median_window == self._raw_history.maxlen:
+            return
+        self._raw_history = deque(self._raw_history, maxlen=config.median_window)
+
     @property
     def sample_count(self) -> int:
         return len(self._raw_history)
@@ -482,6 +960,9 @@ class BrightnessUpdateGate:
     def __init__(self, config: Config):
         self._config = config
         self._last_update_monotonic: float = 0.0
+
+    def set_config(self, config: Config) -> None:
+        self._config = config
 
     def enough_time_passed(self) -> bool:
         return time.monotonic() - self._last_update_monotonic >= self._config.min_seconds_between_updates
@@ -541,6 +1022,45 @@ class ManualOverrideGuard:
         self.offset_pct: int = self._load_offset()
         if self.offset_pct:
             log(f"Restored manual brightness offset: {self.offset_pct:+d}%")
+
+    def set_config(self, config: Config) -> None:
+        """Swaps the config, and follows offset_state_file if it moved - the in-memory
+        offset is the live value, so it is written to the new location rather than
+        re-read from (or left behind at) the old one."""
+        previous_path = self._state_path
+        self._config = config
+        self._state_path = (
+            Path(config.offset_state_file).expanduser() if config.offset_state_file else None
+        )
+        if self._state_path is not None and self._state_path != previous_path:
+            self._save_offset()
+
+    def set_offset(self, offset_pct: int) -> None:
+        """
+        Sets the standing offset directly, as an explicit instruction from the user
+        (the tray's slider), and ends any running override cooldown.
+
+        The cooldown exists to stop auto-adjust from fighting a change the user just
+        made by hand; someone moving Lunos's own slider is asking Lunos to act, not to
+        back off. Deliberately *not* routed through record_override(): that recomputes
+        the offset from actual-minus-target, i.e. round-trips the number through the
+        monitor and hands back a different one than the user picked.
+        """
+        self.offset_pct = max(-99, min(99, int(offset_pct)))
+        self._override_until_monotonic = 0.0
+        self._save_offset()
+
+    def clear_override(self) -> None:
+        """Ends the cooldown early, without touching the standing offset."""
+        self._override_until_monotonic = 0.0
+
+    def start_override(self, seconds: float) -> None:
+        """Pauses auto-adjustment for a while without recording an offset (the tray's
+        explicit 'Pause auto-adjustment', as opposed to a detected manual change)."""
+        self._override_until_monotonic = time.monotonic() + seconds
+
+    def seconds_left(self) -> float:
+        return max(0.0, self._override_until_monotonic - time.monotonic())
 
     def _load_offset(self) -> int:
         """Reads the persisted offset; any problem (missing/corrupt file, wrong type)
@@ -686,105 +1206,391 @@ def read_ambient_lux_values(config: Config):
 # Main loop
 # --------------------------------------------------------------------------- #
 
-def run(config: Config) -> None:
-    monitor = MonitorController(config)
-    median_filter = LuxMedianFilter(config)
-    update_gate = BrightnessUpdateGate(config)
-    override_guard = ManualOverrideGuard(config, monitor)
+PROTOCOL_VERSION = 1  # bumped when the command set or the state snapshot changes shape
 
-    log("Lunos starting...")
+COMMAND_DRAIN_SLICE_SECONDS = 0.25  # how finely the reconnect wait is chopped up to stay responsive
 
-    current_pct = monitor.get_current_brightness_pct()
-    if current_pct is None:
-        current_pct = config.buckets[config.default_bucket_index].brightness_pct
-        current_bucket_index = config.default_bucket_index
-        log(f"Could not read current monitor brightness, assuming {current_pct}%.")
-    else:
-        # Anchor to whichever bucket's target is closest to the monitor's actual current
-        # brightness, not a hardcoded default - otherwise a reading that happens to fall in
-        # the assumed bucket's range never triggers an update, even if the real brightness
-        # doesn't match that bucket's target at all.
-        current_bucket_index = nearest_bucket_index_for_pct(config.buckets, current_pct)
-        log(f"Current monitor brightness: {current_pct}% (Bucket: {current_bucket_index + 1})")
 
-    while True:
+class Daemon:
+    """
+    The reconnect loop, its state, and the only place that state is mutated.
+
+    Everything the loop owns (tracked brightness, current bucket, the filter, the
+    guard, the live config) belongs to the loop thread. The control server runs in
+    a separate thread and never touches any of it directly: commands go through
+    submit(), which the loop drains at the top of each iteration, and the loop
+    publishes a plain-dict snapshot under a lock for readers to copy.
+
+    The cost is latency - a command takes effect on the next lux reading (~1s), or
+    after the current connection attempt when the sensor is down. That is the price
+    of not putting a lock around the loop's own state, and it is invisible in a
+    settings UI.
+    """
+
+    protocol_version = PROTOCOL_VERSION  # read by control.py, which imports nothing from here
+
+    def __init__(self, config: Config, config_path: str | os.PathLike[str] | None = None):
+        self.config = config
+        self._config_path = config_path
+        self.monitor = MonitorController(config)
+        self.median_filter = LuxMedianFilter(config)
+        self.update_gate = BrightnessUpdateGate(config)
+        self.override_guard = ManualOverrideGuard(config, self.monitor)
+
+        self.current_pct: int = 0
+        self.current_bucket_index: int = 0
+
+        self._commands: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue()
+        self._snapshot_lock = threading.Lock()
+        self._snapshot: dict[str, Any] = {}
+        self._listeners: list[Callable[[dict[str, Any]], None]] = []
+
+        self._paused = False               # explicit "pause auto-adjustment", no expiry
+        self._reconnect_requested = False  # a sensor setting changed; drop the stream and re-open it
+        self._stop_requested = False       # clean exit, so systemd's Restart=always restarts us
+        # A change (offset, curve, ...) that must be applied even though the bucket didn't move.
+        # Without this, dragging the offset slider in a room with steady light does nothing until
+        # the light changes, because the loop only acts on bucket transitions.
+        self._target_dirty = False
+
+        self._sensor_connected = False
+        self._last_error: str | None = None
+        self._raw_lux: float | None = None
+        self._median_lux: float | None = None
+
+    # ----------------------------------------------------------------- #
+    # Thread-safe surface (called from the control server's threads)
+    # ----------------------------------------------------------------- #
+
+    def add_snapshot_listener(self, listener: Callable[[dict[str, Any]], None]) -> None:
+        """Registers a callback invoked on the loop thread after every published
+        snapshot. Listeners must not block - the control server only hands the dict
+        to per-connection queues."""
+        self._listeners.append(listener)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._snapshot_lock:
+            return dict(self._snapshot)
+
+    def submit(self, name: str, payload: dict[str, Any] | None = None) -> None:
+        self._commands.put((name, payload or {}))
+
+    def dispatch(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """
+        Handles one control command from any thread. Read-only commands are answered
+        inline; mutating ones are validated here (validation is pure and synchronous)
+        and then queued for the loop thread.
+
+        Replying at validation time rather than after the effect is deliberate: a
+        settings dialog would otherwise block for a full lux reading on every
+        keystroke. The push stream reports what actually happened.
+        """
+        if name == "get_state":
+            return {"ok": True, "state": self.snapshot()}
+
+        if name == "get_schema":
+            return {"ok": True, "schema": config_schema(self.config)}
+
+        if name == "set_config":
+            requested = payload.get("fields")
+            if not isinstance(requested, dict) or not requested:
+                return {"ok": False, "error": "set_config needs a non-empty \"fields\" object"}
+            accepted, errors = validate_config_overrides(requested)
+            if errors:
+                return {"ok": False, "error": "invalid settings", "errors": errors}
+            self.submit("set_config", {"fields": accepted})
+            return {
+                "ok": True,
+                "applied": sorted(n for n in accepted if FIELD_SPECS[n].apply == "hot"),
+                "reconnecting": sorted(n for n in accepted if FIELD_SPECS[n].apply == "reconnect"),
+                "restart_required": sorted(n for n in accepted if FIELD_SPECS[n].apply == "restart"),
+            }
+
+        if name == "set_offset":
+            offset = payload.get("offset_pct")
+            if isinstance(offset, bool) or not isinstance(offset, int):
+                return {"ok": False, "error": "set_offset needs an integer \"offset_pct\""}
+            if not -99 <= offset <= 99:
+                return {"ok": False, "error": "offset_pct must be between -99 and 99"}
+            self.submit("set_offset", {"offset_pct": offset})
+            return {"ok": True, "state": self.snapshot()}
+
+        if name in ("pause", "resume", "reload_config", "restart"):
+            seconds = payload.get("seconds")
+            if name == "pause" and seconds is not None:
+                if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or seconds <= 0:
+                    return {"ok": False, "error": "pause \"seconds\" must be a positive number"}
+            self.submit(name, payload)
+            return {"ok": True, "state": self.snapshot()}
+
+        return {"ok": False, "error": f"unknown command: {name}"}
+
+    # ----------------------------------------------------------------- #
+    # Command execution (loop thread only)
+    # ----------------------------------------------------------------- #
+
+    def _drain_commands(self) -> None:
+        while True:
+            try:
+                name, payload = self._commands.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                self._execute(name, payload)
+            except Exception as error:  # a bad command must never take the daemon down
+                log(f"Control command {name} failed: {error}")
+
+    def _execute(self, name: str, payload: dict[str, Any]) -> None:
+        if name == "set_config":
+            self.apply_config(replace(self.config, **payload["fields"]))
+            save_config(self.config, self._config_path)
+        elif name == "set_offset":
+            self.override_guard.set_offset(payload["offset_pct"])
+            self._paused = False
+            self._target_dirty = True
+            log(f"Manual brightness offset set to {self.override_guard.offset_pct:+d}%")
+        elif name == "pause":
+            seconds = payload.get("seconds")
+            if seconds:
+                self.override_guard.start_override(float(seconds))
+                log(f"Auto-adjustment paused for {float(seconds):.0f}s")
+            else:
+                self._paused = True
+                log("Auto-adjustment paused")
+        elif name == "resume":
+            self._paused = False
+            self.override_guard.clear_override()
+            self._target_dirty = True
+            log("Auto-adjustment resumed")
+        elif name == "reload_config":
+            self.apply_config(load_config(self._config_path))
+            log("Config file re-read")
+        elif name == "restart":
+            log("Restart requested; exiting so the service manager restarts us")
+            self._stop_requested = True
+
+    def apply_config(self, new_config: Config) -> None:
+        """
+        Swaps in a new config and re-applies it across the components, per the apply
+        matrix: most fields are hot, a few need a rebuild, the sensor fields need the
+        SSE stream re-opened (the running generator captured the *old* config, so
+        swapping ours has no effect on it), and default_bucket_index has no runtime
+        effect at all.
+        """
+        previous = self.config
+        self.config = new_config
+
+        adopted_pct = self.monitor.set_config(new_config)
+        self.median_filter.set_config(new_config)
+        self.update_gate.set_config(new_config)
+        self.override_guard.set_config(new_config)
+
+        if adopted_pct is not None:
+            # The backend was re-selected; trust the new backend's own reading.
+            if adopted_pct != self.current_pct:
+                log(f"Re-anchoring tracked brightness after backend change: {self.current_pct}% -> {adopted_pct}%")
+            self.current_pct = adopted_pct
+
+        if adopted_pct is not None or new_config.buckets != previous.buckets:
+            # The old index may not even exist in a new bucket table, and certainly no
+            # longer means the same brightness.
+            self.current_bucket_index = nearest_bucket_index_for_pct(new_config.buckets, self.current_pct)
+
+        if any(
+            getattr(new_config, name) != getattr(previous, name)
+            for name, spec in FIELD_SPECS.items()
+            if spec.apply == "reconnect"
+        ):
+            self._reconnect_requested = True
+
+        self._target_dirty = True
+
+    # ----------------------------------------------------------------- #
+    # State snapshot
+    # ----------------------------------------------------------------- #
+
+    def _publish_snapshot(self) -> None:
+        state = {
+            "protocol": PROTOCOL_VERSION,
+            "raw_lux": self._raw_lux,
+            "median_lux": self._median_lux,
+            "bucket_index": self.current_bucket_index,
+            "bucket_count": len(self.config.buckets),
+            "bucket_pct": self.config.buckets[self.current_bucket_index].brightness_pct,
+            "brightness_pct": self.current_pct,
+            "offset_pct": self.override_guard.offset_pct,
+            "paused": self._paused,
+            "override_active": self.override_guard.active(),
+            "override_seconds_left": round(self.override_guard.seconds_left(), 1),
+            "backend": self.monitor.backend_name,
+            "powerdevil_pending": self.monitor.powerdevil_pending,
+            "sensor_connected": self._sensor_connected,
+            "last_error": self._last_error,
+        }
+        with self._snapshot_lock:
+            self._snapshot = state
+        for listener in list(self._listeners):
+            try:
+                listener(state)
+            except Exception as error:
+                log(f"Snapshot listener failed: {error}")
+
+    # ----------------------------------------------------------------- #
+    # Main loop
+    # ----------------------------------------------------------------- #
+
+    def anchor_to_monitor(self) -> None:
+        current_pct = self.monitor.get_current_brightness_pct()
+        if current_pct is None:
+            # default_bucket_index is only ever read here, and only when the monitor cannot
+            # be read at all. Clamp it: a shrunken bucket table would otherwise index out.
+            index = min(self.config.default_bucket_index, len(self.config.buckets) - 1)
+            self.current_pct = self.config.buckets[index].brightness_pct
+            self.current_bucket_index = index
+            log(f"Could not read current monitor brightness, assuming {self.current_pct}%.")
+        else:
+            # Anchor to whichever bucket's target is closest to the monitor's actual current
+            # brightness, not a hardcoded default - otherwise a reading that happens to fall in
+            # the assumed bucket's range never triggers an update, even if the real brightness
+            # doesn't match that bucket's target at all.
+            self.current_pct = current_pct
+            self.current_bucket_index = nearest_bucket_index_for_pct(self.config.buckets, current_pct)
+            log(f"Current monitor brightness: {current_pct}% (Bucket: {self.current_bucket_index + 1})")
+
+    def handle_reading(self, raw_lux: float) -> None:
+        """One lux reading: filter, pick a bucket, detect manual changes, apply brightness."""
+        if self.median_filter.sample_count == 0:
+            log("Connected, waiting for lux values.")
+        self._sensor_connected = True
+        self._last_error = None
+
+        # PowerDevil may have started after us (login race) - upgrade to it when it shows
+        # up, re-anchoring our tracked brightness to whatever it reports.
+        adopted_pct = self.monitor.maybe_adopt_powerdevil(self.current_pct)
+        if adopted_pct is not None:
+            self.current_pct = adopted_pct
+            self.current_bucket_index = nearest_bucket_index_for_pct(self.config.buckets, self.current_pct)
+
+        self._raw_lux = raw_lux
+        smoothed_lux = self.median_filter.add_reading(raw_lux)
+        self._median_lux = smoothed_lux
+        target_bucket_index = select_bucket_index(self.config.buckets, smoothed_lux, self.current_bucket_index)
+        target_bucket_pct = self.config.buckets[target_bucket_index].brightness_pct
+
+        log(
+            f"Raw: {raw_lux:.1f} lx | Median: {smoothed_lux:.1f} lx "
+            f"| Bucket: {target_bucket_index + 1} ({target_bucket_pct}%) "
+            f"| Brightness: {self.current_pct}% "
+            f"| Offset: {self.override_guard.offset_pct:+d}%"
+        )
+
+        actual_pct = self.override_guard.poll_actual(self.current_pct)
+
+        if actual_pct is not None:
+            # The monitor diverged from what we track. On the ddcutil fallback this is
+            # often PowerDevil taking over at login (its DDC write and its D-Bus
+            # registration are the same arrival event), not the user - so re-check for
+            # PowerDevil right now, before recording a manual override, and adopt it if
+            # present, re-anchoring to its value instead of blaming the user.
+            adopted_pct = self.monitor.maybe_adopt_powerdevil(self.current_pct, force=True)
+            if adopted_pct is not None:
+                self.current_pct = adopted_pct
+                self.current_bucket_index = nearest_bucket_index_for_pct(self.config.buckets, self.current_pct)
+                return
+
+            # Genuinely external - treat as a manual override.
+            self.override_guard.record_override(actual_pct, target_bucket_pct)
+            self.current_pct = actual_pct
+            # Anchor to the ambient-selected bucket, not the bucket nearest the manual
+            # brightness: the offset now carries the manual delta relative to this bucket,
+            # and re-anchoring to a different bucket would double-count that delta.
+            self.current_bucket_index = target_bucket_index
+            self._target_dirty = False  # the user's own value is the target now
+            log(
+                f"Manual brightness change: {self.current_pct}% (Offset: {self.override_guard.offset_pct:+d}%) \n"
+                f"Pausing auto-adjustment ({self.config.manual_override_cooldown_seconds:.0f}s)"
+            )
+            notify(f"Manual brightness change to {self.current_pct}%. \n Pausing auto-adjustment for {(self.config.manual_override_cooldown_seconds / 60):.0f} Minutes.", self.config)
+            return
+
+        if target_bucket_index == self.current_bucket_index and not self._target_dirty:
+            return
+        if self._paused or self.override_guard.active():
+            return
+        if not self.update_gate.enough_time_passed():
+            return
+
+        target_pct = max(
+            self.config.min_brightness_pct,
+            min(100, target_bucket_pct + self.override_guard.offset_pct),
+        )
+
         try:
-            log(f"Connecting to sensor at {config.sensor_url} ...")
-            for raw_lux in read_ambient_lux_values(config):
-                if median_filter.sample_count == 0:
-                    log("Connected, waiting for lux values.")
+            self.monitor.ramp_to(self.current_pct, target_pct)
+            self.current_pct = target_pct
+            self.current_bucket_index = target_bucket_index
+            self._target_dirty = False
+            self.update_gate.mark_applied()
+            log(f"Brightness set: {target_pct}% (at {smoothed_lux:.1f} lx)")
+            if not self.monitor.shows_native_osd:
+                notify(f"Brightness: {target_pct}% ({smoothed_lux:.1f} lx)", self.config)
+        except RuntimeError as error:
+            self._last_error = str(error)
+            log(f"ERROR while setting brightness ({target_pct}%): {error}")
+            notify(f"Error setting brightness: {str(error)[:80]}", self.config)
 
-                # PowerDevil may have started after us (login race) - upgrade to it when it shows
-                # up, re-anchoring our tracked brightness to whatever it reports.
-                adopted_pct = monitor.maybe_adopt_powerdevil(current_pct)
-                if adopted_pct is not None:
-                    current_pct = adopted_pct
-                    current_bucket_index = nearest_bucket_index_for_pct(config.buckets, current_pct)
+    def _sleep_draining(self, seconds: float) -> None:
+        """Waits, but keeps answering control commands - otherwise a 'restart' or a fixed
+        sensor URL would sit unapplied for the whole reconnect delay."""
+        deadline = time.monotonic() + seconds
+        while True:
+            self._drain_commands()
+            if self._stop_requested:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(COMMAND_DRAIN_SLICE_SECONDS, remaining))
 
-                smoothed_lux = median_filter.add_reading(raw_lux)
-                target_bucket_index = select_bucket_index(config.buckets, smoothed_lux, current_bucket_index)
-                target_bucket_pct = config.buckets[target_bucket_index].brightness_pct
+    def run(self) -> None:
+        log("Lunos starting...")
+        self.anchor_to_monitor()
+        self._publish_snapshot()
 
-                log(
-                    f"Raw: {raw_lux:.1f} lx | Median: {smoothed_lux:.1f} lx "
-                    f"| Bucket: {target_bucket_index + 1} ({target_bucket_pct}%) "
-                    f"| Brightness: {current_pct}% "
-                    f"| Offset: {override_guard.offset_pct:+d}%"
-                )
+        while not self._stop_requested:
+            try:
+                self._reconnect_requested = False
+                log(f"Connecting to sensor at {self.config.sensor_url} ...")
+                for raw_lux in read_ambient_lux_values(self.config):
+                    self._drain_commands()
+                    if self._stop_requested:
+                        break
+                    if self._reconnect_requested:
+                        log("Sensor settings changed, reconnecting.")
+                        break
+                    self.handle_reading(raw_lux)
+                    self._publish_snapshot()
+            except Exception as error:
+                self._sensor_connected = False
+                self._last_error = str(error)
+                self._publish_snapshot()
+                log(f"Sensor connection lost: {error}, retry in {self.config.reconnect_delay_seconds}s")
+                self._sleep_draining(self.config.reconnect_delay_seconds)
 
-                actual_pct = override_guard.poll_actual(current_pct)
 
-                if actual_pct is not None:
-                    # The monitor diverged from what we track. On the ddcutil fallback this is
-                    # often PowerDevil taking over at login (its DDC write and its D-Bus
-                    # registration are the same arrival event), not the user - so re-check for
-                    # PowerDevil right now, before recording a manual override, and adopt it if
-                    # present, re-anchoring to its value instead of blaming the user.
-                    adopted_pct = monitor.maybe_adopt_powerdevil(current_pct, force=True)
-                    if adopted_pct is not None:
-                        current_pct = adopted_pct
-                        current_bucket_index = nearest_bucket_index_for_pct(config.buckets, current_pct)
-                        continue
-
-                    # Genuinely external - treat as a manual override.
-                    override_guard.record_override(actual_pct, target_bucket_pct)
-                    current_pct = actual_pct
-                    # Anchor to the ambient-selected bucket, not the bucket nearest the manual
-                    # brightness: the offset now carries the manual delta relative to this bucket,
-                    # and re-anchoring to a different bucket would double-count that delta.
-                    current_bucket_index = target_bucket_index
-                    log(
-                        f"Manual brightness change: {current_pct}% (Offset: {override_guard.offset_pct:+d}%) \n"
-                        f"Pausing auto-adjustment ({config.manual_override_cooldown_seconds:.0f}s)"
-                    )
-                    notify(f"Manual brightness change to {current_pct}%. \n Pausing auto-adjustment for {(config.manual_override_cooldown_seconds / 60):.0f} Minutes.", config)
-                    continue
-
-                if target_bucket_index == current_bucket_index:
-                    continue
-                if override_guard.active():
-                    continue
-                if not update_gate.enough_time_passed():
-                    continue
-
-                target_pct = max(config.min_brightness_pct, min(100, target_bucket_pct + override_guard.offset_pct))
-
-                try:
-                    monitor.ramp_to(current_pct, target_pct)
-                    current_pct = target_pct
-                    current_bucket_index = target_bucket_index
-                    update_gate.mark_applied()
-                    log(f"Brightness set: {target_pct}% (at {smoothed_lux:.1f} lx)")
-                    if not monitor.shows_native_osd:
-                        notify(f"Brightness: {target_pct}% ({smoothed_lux:.1f} lx)", config)
-                except RuntimeError as error:
-                    log(f"ERROR while setting brightness ({target_pct}%): {error}")
-                    notify(f"Error setting brightness: {str(error)[:80]}", config)
-
-        except Exception as error:
-            log(f"Sensor connection lost: {error}, retry in {config.reconnect_delay_seconds}s")
-            time.sleep(config.reconnect_delay_seconds)
+def run(config: Config) -> None:
+    Daemon(config).run()
 
 
 if __name__ == "__main__":
-    run(Config())
+    import control
+
+    daemon = Daemon(load_config())
+    server = control.serve(daemon)  # optional: the daemon runs on without a control socket
+    try:
+        daemon.run()
+    finally:
+        if server is not None:
+            # Unlink the socket on the way out, so the next start doesn't have to
+            # decide whether a leftover file is stale or a live second instance.
+            server.server_close()

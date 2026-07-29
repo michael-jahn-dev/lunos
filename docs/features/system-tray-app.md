@@ -1,7 +1,12 @@
 # System tray app (Fedora)
 
-**Status:** Planned
+**Status:** Implemented (pending the manual-validation checklist at the end of this document)
 **Tracking issue:** [#2](https://github.com/michael-jahn-dev/lunos/issues/2)
+
+Implemented as designed, with one deviation worth recording: `run()` was refactored into a
+`Daemon` class rather than kept as a function. The command queue, the state snapshot and a
+single testable loop iteration all need somewhere to live, and threading them through a
+function's locals would have been worse than the class. `run(config)` remains as a thin wrapper.
 
 ## Summary
 
@@ -121,7 +126,9 @@ in the tray menu would work in a test harness and be invisible in the real tray.
 Menu layout that survives that constraint:
 
 ```
-Lunos — 342 lx · 65% · bucket 5        (disabled item, live state)
+Lunos                                   (disabled item, heading)
+342 lx · 65% · bucket 5 (80%)           (disabled item, live state)
+Offset +10%                             (disabled item)
 Backend: KDE PowerDevil                 (disabled item)
 ─────────────────────────────────────
 Brightness offset          ▸  [radio group: -30 … +30 in 5% steps, current checked]
@@ -141,7 +148,13 @@ Quit tray app                          (does NOT stop the daemon — label says 
   window and works fine.
 - The **state header items** update from the daemon's push stream (§4), so the tray
   is live without polling. Plasma re-reads the menu on open; also refresh on
-  `aboutToShow`.
+  `aboutToShow`. The summary is split across several disabled items rather than one
+  item containing `\n`: DBusMenu carries a label, and a host may render an embedded
+  newline as a space or clip the label at it. The tooltip is a single string, so it
+  gets the same lines with real breaks.
+- Both percentages are shown — the bucket's own target and the brightness actually
+  applied. They differ by the offset and by `min_brightness_pct`, so showing only one
+  makes a clamped or offset value look like a bug.
 - **Tooltip** carries the same state, for hover without opening the menu.
 - **Left click** triggers SNI `Activate` → open the settings window. Plasma's default.
 - **Icon:** `QIcon.fromTheme()` with a fallback chain

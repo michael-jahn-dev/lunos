@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" width="22" height="22">
+  <!-- Last-resort tray icon: used only when neither the Breeze nor the Adwaita
+       brightness symbol is present in the icon theme. Drawn with currentColor so
+       it still follows a light/dark switch where the host supports it. -->
+  <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+    <circle cx="11" cy="11" r="3.6" fill="currentColor" stroke="none"/>
+    <path d="M11 2.2v2.4M11 17.4v2.4M2.2 11h2.4M17.4 11h2.4"/>
+    <path d="M4.8 4.8l1.7 1.7M15.5 15.5l1.7 1.7M17.2 4.8l-1.7 1.7M6.5 15.5l-1.7 1.7"/>
+  </g>
+</svg>
