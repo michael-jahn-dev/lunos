@@ -88,10 +88,9 @@ venv/bin/python3 -m unittest discover -s tests -t . -v   # verbose
 venv/bin/python3 -m unittest tests.test_main             # just the daemon logic
 ```
 
-`tests/test_tray.py` is skipped unless PySide6 is installed; the rest of the tray (SNI
-registration, DBusMenu rendering, the login race) is covered by the manual checklist in
-[`docs/features/system-tray-app.md`](docs/features/system-tray-app.md), which no unit test can
-stand in for.
+`tests/test_tray.py` is skipped unless PySide6 is installed. The rest of the tray — SNI
+registration, DBusMenu rendering, the login race — has no automated coverage at all and is left
+to ordinary use on the desktop it runs on.
 
 ## System tray app
 
