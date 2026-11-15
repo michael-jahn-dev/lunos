@@ -60,6 +60,11 @@ registers + starts a systemd user service (`lunos.service`) that restarts automa
 Re-running it is safe and idempotent: it reuses the existing venv, rewrites the unit file, and
 restarts the service — so a re-run also applies any changes you've made to `main.py`.
 
+After a distro upgrade that bumps the system Python (e.g. Fedora 45: 3.14 → 3.15), the old venv
+no longer works (`ModuleNotFoundError: No module named 'requests'` in the journal). `install.sh`
+detects this — venv built for a different Python version, or its dependencies not importable — and
+recreates the venv automatically, so a plain re-run is all that's needed.
+
 `--with-tray` additionally installs `lunos-tray.service` and a `.desktop` entry (see
 [System tray app](#system-tray-app)). It checks for PySide6 on the *system* interpreter and tells
 you to `sudo dnf install python3-pyside6` rather than pulling a ~150 MB wheel into the venv.

@@ -27,6 +27,22 @@ done
 
 echo "Project directory: $PROJECT_DIR"
 
+# A venv is tied to the Python minor version it was created with. After a distro
+# upgrade (e.g. Fedora 45: 3.14 -> 3.15) the old venv still exists but its packages
+# live under the old lib/pythonX.Y/, so the daemon dies with ModuleNotFoundError.
+# Detect that and rebuild instead of silently reusing a broken venv.
+SYS_PY_VER="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+if [ -d "$VENV_DIR" ]; then
+    VENV_PY_VER="$("$VENV_DIR/bin/python3" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)"
+    if [ "$VENV_PY_VER" != "$SYS_PY_VER" ] \
+        || ! "$VENV_DIR/bin/python3" -c "import requests, sseclient" >/dev/null 2>&1; then
+        echo "Existing venv is stale (venv: ${VENV_PY_VER:-broken}, system: $SYS_PY_VER) - recreating..."
+        # Stop the service first so its Restart=always loop doesn't crash against a half-built venv
+        systemctl --user stop lunos.service 2>/dev/null || true
+        rm -rf "$VENV_DIR"
+    fi
+fi
+
 # Create venv and install dependencies
 if [ ! -d "$VENV_DIR" ]; then
     echo "Creating virtual environment..."
