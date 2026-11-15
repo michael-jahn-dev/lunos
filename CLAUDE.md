@@ -96,7 +96,7 @@ When behavior, a setting, the protocol, a dependency or the installer changes, u
 
 - Code, docs, commits and PRs in English (public repo). Replies to the user: German and short.
 - Python and shell: 4-space indentation, as in the existing code.
-- Commands given to the user must work in **zsh** (quote globs, e.g. `rm -f "*.pyc"` patterns).
+- Commands given to the user must work in **zsh** (quote glob patterns passed to tools, e.g. `find . -name "*.pyc"`).
 - Prefer the stdlib and existing CLIs over new dependencies.
 - No secrets in the repo; `.env` is git-ignored.
 - Mark anything not verified on real hardware (monitor, sensor, PowerDevil) as "not tested on hardware". The unit tests use fakes and do not prove that.
