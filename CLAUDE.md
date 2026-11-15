@@ -62,3 +62,64 @@ The frozen `Config` dataclass at the top of `main.py` is the **schema, the defau
 - **Overlapping buckets are correct.** The tray's curve editor warns when adjacent buckets *don't* overlap. Inverting that warning would push users into a visibly flickering curve — it is the single most damaging possible bug in that dialog.
 - `control.py` deliberately imports nothing from `main.py`: `main.py` runs as a script, so importing it back by name would create a second module object with its own `Config` class. Everything the server needs is duck-typed off the daemon object it is handed.
 - Bump `PROTOCOL_VERSION` (in `main.py`, mirrored in `tray.py`) whenever the command set or the snapshot shape changes; both halves check it so mismatched versions fail loudly.
+
+## Working rules
+
+### 1. Git: always via pull request
+
+- **Never push to `main` directly.** Every change goes on its own branch and into a PR.
+- Branch: `<type>/<short-topic>` with `type` one of `fix`, `feat`, `docs`, `refactor`, `test` (e.g. `fix/stale-venv`, `docs/working-rules`).
+- Commit messages and PR titles: English, imperative, matching the existing history ("Add …", "Fix …", "Remove …").
+- Before branching, `git fetch origin main` and branch off the current `main`.
+- One topic per PR. The user reviews and merges.
+- Run the test suite before opening the PR and state the result in the PR description.
+
+### 2. Every behavior change is documented in the same PR
+
+When behavior, a setting, the protocol, a dependency or the installer changes, update every affected place in the same PR — not on request later:
+
+| Change | Places |
+|---|---|
+| New or changed `Config` field | `FIELD_SPECS`, "Notable fields" table in `README.md`, test in `tests/test_main.py` |
+| Changed bucket defaults | bucket table in `README.md` ("Overlapping bucket table") |
+| Control command or snapshot shape | `PROTOCOL_VERSION` in `main.py` **and** `tray.py`, command table in `README.md`, `tests/test_control.py` |
+| Tray UI behavior | "System tray app" in `README.md`, `tests/test_tray.py` where testable |
+| New Python dependency | `requirements.txt`, "Requirements" in `README.md` — ask first, the stdlib/CLI approach (`busctl`) is deliberate |
+| New system dependency | "Requirements" in `README.md`, check in `install.sh` if it is needed to run |
+| `install.sh` or systemd unit change | "Installation"/"Usage" in `README.md`, "Commands" here |
+| Backend behavior | "Brightness backend" in `README.md` design notes, "Gotchas" here |
+| Solved problem or pitfall | "Gotchas" here; a user-visible symptom with its fix also in `README.md` |
+| Issue from `PLAN.md` fixed | remove or mark it in `PLAN.md` |
+| Feature from `docs/features/` implemented | remove the feature doc (as done for the tray) and reference the tracking issue in the PR |
+
+### 3. Style
+
+- Everything in the repo is English (public repo): code, docs, commits, PRs. Keep replies to the user short.
+- Python and shell: 4-space indentation, as in the existing code.
+- Commands given to the user must work in **zsh** (quote glob patterns passed to tools, e.g. `find . -name "*.pyc"`).
+- Prefer the stdlib and existing CLIs over new dependencies.
+- No secrets in the repo; `.env` is git-ignored.
+- Mark anything not verified on real hardware (monitor, sensor, PowerDevil) as "not tested on hardware". The unit tests use fakes and do not prove that.
+- Only document what is actually implemented. Plans go to `docs/features/` or `PLAN.md`.
+
+### 4. Reference setup
+
+The setup Lunos is developed and run on:
+
+| What | Value |
+|---|---|
+| OS | Fedora 45, KDE Plasma 6, system Python 3.15 |
+| Shell | zsh |
+| Monitor | Philips Evnia 32M2N8900 (31.5" 4K OLED, DDC/CI) |
+| Active backend | KDE PowerDevil (`org.kde.ScreenBrightness`) |
+| Sensor | ESP32 at `http://lunarsensor.local/events` |
+| Service | `lunos.service` (systemd user unit, venv in `venv/`) |
+
+### 5. Caution with recommendations
+
+- A Fedora upgrade that bumps the system Python breaks `venv/` (`ModuleNotFoundError: No module named 'requests'`). Fix: recreate the venv (`rm -rf venv && ./install.sh`). Check this first when the daemon dies after an upgrade.
+- Don't write brightness with `ddcutil setvcp` while PowerDevil manages the display — two DDC/CI writers race and Plasma's slider goes stale. Debug through the control socket or `busctl` instead.
+- Keep DDC/CI writes rate-limited (`min_seconds_between_updates`, `max_transition_steps`): each write is a real I2C round-trip, and the monitor is an OLED.
+- Never delete `~/.config/lunos/config.json` or `~/.local/state/lunos/offset.json` without asking — they hold the user's settings and learned offset.
+- No `git push --force` to `main`, no history rewrites on shared branches.
+- Look up versions, Fedora package names, and KDE D-Bus APIs before naming them.
