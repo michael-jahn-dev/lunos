@@ -94,7 +94,7 @@ When behavior, a setting, the protocol, a dependency or the installer changes, u
 
 ### 3. Style
 
-- Code, docs, commits and PRs in English (public repo). Replies to the user: German and short.
+- Everything in the repo is English (public repo): code, docs, commits, PRs. Keep replies to the user short.
 - Python and shell: 4-space indentation, as in the existing code.
 - Commands given to the user must work in **zsh** (quote glob patterns passed to tools, e.g. `find . -name "*.pyc"`).
 - Prefer the stdlib and existing CLIs over new dependencies.
