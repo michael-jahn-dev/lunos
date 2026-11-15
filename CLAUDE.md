@@ -26,7 +26,7 @@ venv/bin/python3 -m unittest discover -s tests -t .   # run all unit tests (from
 socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/lunos/control.sock   # drive the control socket by hand
 ```
 
-There is no build or lint tooling. `install.sh` is idempotent: it reuses an existing `venv/`, rewrites the unit files, and restarts the services each run — so re-running it also applies changes to `main.py`.
+There is no build or lint tooling. `install.sh` is idempotent: it reuses an existing `venv/` (recreating it if it was built for a different Python minor version or its deps don't import — e.g. after a Fedora upgrade), rewrites the unit files, and restarts the services each run — so re-running it also applies changes to `main.py`.
 
 **Run the tests after every change** (`venv/bin/python3 -m unittest discover -s tests -t .`, from the repo root — `-t .` is what keeps `import main` working) and confirm they pass before considering the change done. The tests use fakes for the monitor and sensor, so they need no hardware, `busctl`, or `ddcutil` — but they do import `main`, so run them through the venv (which has `requests`/`sseclient`). When you change or add behavior, add or update the corresponding test in the same edit.
 
@@ -117,7 +117,7 @@ The setup Lunos is developed and run on:
 
 ### 5. Caution with recommendations
 
-- A Fedora upgrade that bumps the system Python breaks `venv/` (`ModuleNotFoundError: No module named 'requests'`). Fix: recreate the venv (`rm -rf venv && ./install.sh`). Check this first when the daemon dies after an upgrade.
+- A Fedora upgrade that bumps the system Python breaks `venv/` (`ModuleNotFoundError: No module named 'requests'`). `install.sh` detects this and recreates the venv, so the fix is a plain `./install.sh` re-run. Check this first when the daemon dies after an upgrade.
 - Don't write brightness with `ddcutil setvcp` while PowerDevil manages the display — two DDC/CI writers race and Plasma's slider goes stale. Debug through the control socket or `busctl` instead.
 - Keep DDC/CI writes rate-limited (`min_seconds_between_updates`, `max_transition_steps`): each write is a real I2C round-trip, and the monitor is an OLED.
 - Never delete `~/.config/lunos/config.json` or `~/.local/state/lunos/offset.json` without asking — they hold the user's settings and learned offset.
